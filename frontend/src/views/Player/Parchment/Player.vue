@@ -17,12 +17,6 @@ const emitter = inject<Emitter<Events>>("emitter");
 
 // Manage global scripts via VueUse
 // We need jQuery before Parchment
-// Note: useScriptTag handles mounting and removing scripts from DOM on component unmount automatically if not manual?
-// Documentation says: "Automatically load the script on mount, and unload on unmount."
-// BUT since we need sequential loading (jQuery then Parchment), we use manual loading.
-// When manual: true, unloading is also manual unless we manage lifecycle.
-// However, `useScriptTag` returns an `unload` function. We should call it.
-
 const jqueryScript = useScriptTag(
     '/assets/parchment/jquery.min.js',
     () => { /* Loaded */ },
@@ -34,6 +28,30 @@ const parchmentScript = useScriptTag(
     () => { /* Loaded */ },
     { manual: true }
 );
+
+async function loadSave(save: SaveSchema) {
+    if (!save) return;
+    console.log("[RomM] User requested save load:", save.file_name);
+    // Use our utility to inject the specific save
+    await prepareCloudSave(props.rom, save);
+}
+
+function enterFullscreen() {
+    const el = document.getElementById('parchment-root');
+    if (el) {
+        if (el.requestFullscreen) {
+            el.requestFullscreen();
+        } else if ((el as any).webkitRequestFullscreen) {
+            (el as any).webkitRequestFullscreen();
+        } else if ((el as any).msRequestFullscreen) {
+            (el as any).msRequestFullscreen();
+        }
+    }
+}
+
+function resetGame() {
+    window.location.reload();
+}
 
 onMounted(async () => {
     // Configure Parchment Options
@@ -58,7 +76,6 @@ onMounted(async () => {
         await parchmentScript.load();
 
         // Start waiting for Parchment to be ready to inject the cloud save
-        // We don't await this because it polls and we don't want to block the UI thread if possible
         prepareCloudSave(props.rom);
     } catch (err) {
         console.error('Error loading Parchment scripts:', err);
@@ -81,33 +98,17 @@ onUnmounted(() => {
     // Attempt to cleanup Parchment global instance if it exists
     if ((window as any).parchment) delete (window as any).parchment;
 });
-
-async function loadSave(save: SaveSchema) {
-    console.log("[RomM] User requested save load:", save.file_name);
-    emitter?.on("saveSelected", loadSave);
-});
-
-onUnmounted(() => {
-    // Unload scripts to clean up DOM
-    jqueryScript.unload();
-    parchmentScript.unload();
-    cument.getElementById('parchment-root');
-    if (el) {
-        if (el.requestFullscreen) {
-            el.requestFullscreen();
-        } else if ((el as any).webkitRequestFullscreen) {
-            (el as any).webkitRequestFullscreen();
-        } else if ((el as any).msRequestFullscreen) {
-            (el as any).msRequestFullscreen();
-        }
-    }
-}
 </script>
 
 <template>
     <div id="parchment-root" class="parchment-container">
-        <v-btn icon="mdi-fullscreen" variant="text" color="white" class="fullscreen-btn"
-            style="position: absolute; top: 10px; right: 10px; z-index: 1000;" @click="enterFullscreen" />
+        <!-- Controls Overlay -->
+        <div class="parchment-controls">
+            <v-btn icon="mdi-restart" variant="text" color="white" @click="resetGame" title="Reset Game"
+                class="control-btn" />
+            <v-btn icon="mdi-fullscreen" variant="text" color="white" @click="enterFullscreen" title="Fullscreen"
+                class="control-btn" />
+        </div>
 
         <!-- 
             Parchment expects specific IDs in the DOM.
@@ -137,6 +138,8 @@ onUnmounted(() => {
     height: 100%;
     position: relative;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
 }
 
 .parchment-controls {
@@ -154,33 +157,11 @@ onUnmounted(() => {
     opacity: 1;
 }
 
-.control-btn {
-    background: rgba(0, 0, 0, 0.5);
-    color: white;
-    border: none;
-    border-radius: 4px;
-    width: 32px;
-    height: 32px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 20px;
-}
-
-.control-btn:hover {
-    background: rgba(0, 0, 0, 0.8);
-}
-</style>
-display: flex;
-flex-direction: column;
-}
-
 /* Ensure the gameport takes full size */
 #gameport {
-width: 100%;
-height: 100%;
-background-color: #f0f0f0;
-flex: 1;
+    width: 100%;
+    height: 100%;
+    background-color: #f0f0f0;
+    flex: 1;
 }
 </style>
