@@ -4,6 +4,7 @@ import { useScriptTag } from '@vueuse/core';
 import type { Emitter } from "mitt";
 import type { Events } from "@/types/emitter";
 import type { SaveSchema } from "@/__generated__";
+import api from '@/services/api';
 import { getDownloadPath } from '@/utils';
 import type { DetailedRom } from '@/stores/roms';
 import '@/assets/parchment-scoped.css';
@@ -53,30 +54,102 @@ function resetGame() {
     window.location.reload();
 }
 
+const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    const chunkSize = 0x8000; // 32KB chunks to avoid stack overflow
+    for (let i = 0; i < len; i += chunkSize) {
+        // @ts-ignore
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return window.btoa(binary);
+};
+
+let objectUrl: string | null = null;
+
 onMounted(async () => {
     // Configure Parchment Options
-    const romUrl = getDownloadPath({ rom: props.rom });
+    let romUrl = getDownloadPath({ rom: props.rom });
+    // Add emulator=parchment to force direct file serving from backend
+    // This is required to get the raw file content instead of an X-Accel-Redirect 
+    // when running in dev mode without Nginx, and ensures consistent behavior.
+    if (romUrl.includes('?')) {
+        romUrl += '&emulator=parchment';
+    } else {
+        romUrl += '?emulator=parchment';
+    }
+
+    let storyPath = romUrl;
+
+    try {
+        console.log('[RomM] Fetching ROM from:', romUrl);
+        // Fetch the ROM via API client (Axios) to ensure authentication headers are included.
+        // We strip /api context because the API client adds it automatically.
+        const axiosUrl = romUrl.replace(/^\/api/, '');
+        const response = await api.get(axiosUrl, {
+            responseType: 'arraybuffer',
+            // Ensure we don't follow redirects automatically if we want to catch 302/403 (Axios usually handles this)
+        });
+
+        console.log('[RomM] Response status:', response.status);
+
+        if (response.status === 200) {
+            const contentType = response.headers['content-type'] || response.headers['Content-Type'];
+            if (contentType && (contentType.includes('application/json') || contentType.includes('text/html'))) {
+                console.error('[RomM] Invalid content type for ROM:', contentType);
+                // If it's JSON, try to read it to show the error
+                if (contentType.includes('application/json')) {
+                    const dec = new TextDecoder();
+                    console.error('[RomM] Response body:', dec.decode(response.data));
+                }
+                throw new Error('Invalid content type: ' + contentType);
+            }
+
+            // Convert to Base64 and wrap in JSONP callback to satisfy Parchment loader
+            const buffer = response.data;
+            const base64 = arrayBufferToBase64(buffer);
+            const wrapped = `processBase64Zcode('${base64}')`;
+
+            // Create Blob as JS file
+            const blob = new Blob([wrapped], { type: 'text/javascript' });
+            objectUrl = URL.createObjectURL(blob);
+
+            // Append filename fragment to help Parchment identify the file type
+            // Force .z5 extension if not present, to avoid Parchment treating it as JS
+            let filename = props.rom.fs_name || 'game.z5';
+            if (!filename.match(/\.(z[1-8]|zblorb|blb|ulx|gblorb|glulx)$/i)) {
+                filename += '.z5';
+            }
+            storyPath = objectUrl + '#' + filename;
+        } else {
+            console.error('[RomM] Fetch failed:', response.status);
+        }
+    } catch (e) {
+        console.error("Failed to fetch ROM as Blob via API", e);
+    }
 
     // Set global options for Parchment
     // We attach to window as required by the library
     (window as any).parchment_options = {
-        default_story: [romUrl],
+        default_story: [storyPath],
         lib_path: '/assets/parchment/',
         story_name: props.rom.name,
-        // auto_launch: true // Default behavior launches the story
     };
 
     // Load Scripts Sequentially
     try {
         await jqueryScript.load();
 
+        console.log('[RomM] Parchment story path:', storyPath);
+
         // Inject hooks before Parchment fully initializes or as soon as possible
-        injectSaveHooks(props.rom);
+        // injectSaveHooks(props.rom);
 
         await parchmentScript.load();
 
         // Start waiting for Parchment to be ready to inject the cloud save
-        prepareCloudSave(props.rom);
+        // prepareCloudSave(props.rom);
     } catch (err) {
         console.error('Error loading Parchment scripts:', err);
     }
@@ -86,6 +159,10 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+    // Revoke object URL
+    if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+    }
     // Unload scripts to clean up DOM
     jqueryScript.unload();
     parchmentScript.unload();
@@ -144,13 +221,16 @@ onUnmounted(() => {
 
 .parchment-controls {
     position: absolute;
-    top: 10px;
+    bottom: 10px;
     right: 10px;
     z-index: 1000;
     display: flex;
     gap: 8px;
     opacity: 0.3;
     transition: opacity 0.3s;
+    background-color: rgba(0, 0, 0, 0.5);
+    padding: 5px;
+    border-radius: 5px;
 }
 
 .parchment-controls:hover {

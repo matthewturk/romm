@@ -115,7 +115,7 @@ onBeforeUnmount(async () => {
     </v-row>
 </template>
 
-<style lang="scss" scoped>
+<style scoped>
 .game-info-col {
     display: flex;
     justify-content: center;
