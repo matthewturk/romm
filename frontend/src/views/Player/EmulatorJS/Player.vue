@@ -356,6 +356,43 @@ window.EJS_onGameStart = async () => {
       ...window.EJS_emulator.settings,
       "save-state-location": "browser",
     };
+
+    // Capture the original function
+    const originalToggle = window.EJS_emulator.toggleFullscreen;
+
+    // Overwrite with our patched version
+    window.EJS_emulator.toggleFullscreen = async function (fullscreen: boolean) {
+      if (fullscreen) {
+        // 1. Execute original fullscreen request
+        // .call(this) ensures we don't break internal EJS references
+        originalToggle.call(this, fullscreen);
+
+        // 2. Wait a tick for the browser to transition
+        setTimeout(async () => {
+          if ('keyboard' in navigator && navigator.keyboard.lock) {
+            try {
+              await navigator.keyboard.lock([
+                "Escape",
+                "Tab",
+                "AltLeft",
+                "ControlLeft",
+                "MetaLeft"
+              ]);
+              console.log("Keyboard lock active via Vue monkeypatch.");
+            } catch (err) {
+              console.warn("Keyboard lock failed:", err);
+            }
+          }
+        }, 200); // 200ms is usually enough for the FS transition to 'settle'
+      } else {
+        // 3. Unlock when exiting
+        if ('keyboard' in navigator && navigator.keyboard.unlock) {
+          navigator.keyboard.unlock();
+        }
+        originalToggle.call(this, fullscreen);
+      }
+    };
+
   }, 10);
 
   const quickLoad = createQuickLoadButton();
@@ -449,18 +486,10 @@ onUnmounted(() => {
 
 <template>
   <div id="game" />
-  <div
-    v-if="rom.ss_metadata?.bezel_path"
-    class="pointer-events-none fixed inset-0 flex items-center justify-center z-20 overflow-hidden"
-    aria-hidden="true"
-  >
-    <img
-      :src="rom.ss_metadata.bezel_path"
-      alt=""
-      class="select-none"
-      draggable="false"
-      style="height: 100vh; max-height: 100%; width: auto; object-fit: cover"
-    />
+  <div v-if="rom.ss_metadata?.bezel_path"
+    class="pointer-events-none fixed inset-0 flex items-center justify-center z-20 overflow-hidden" aria-hidden="true">
+    <img :src="rom.ss_metadata.bezel_path" alt="" class="select-none" draggable="false"
+      style="height: 100vh; max-height: 100%; width: auto; object-fit: cover" />
   </div>
 </template>
 

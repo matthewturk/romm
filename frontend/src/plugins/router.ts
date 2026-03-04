@@ -27,6 +27,7 @@ export const ROUTES = {
   ROM: "rom",
   EMULATORJS: "emulatorjs",
   RUFFLE: "ruffle",
+  PARCHMENT: "parchment",
   SCAN: "scan",
   PATCHER: "patcher",
   USER_PROFILE: "user-profile",
@@ -180,6 +181,11 @@ const routes = [
         path: "rom/:rom/ruffle",
         name: ROUTES.RUFFLE,
         component: () => import("@/views/Player/RuffleRS/Base.vue"),
+      },
+      {
+        path: "rom/:rom/parchment",
+        name: ROUTES.PARCHMENT,
+        component: () => import("@/views/Player/Parchment/Base.vue"),
       },
       {
         path: "scan",

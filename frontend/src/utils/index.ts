@@ -630,6 +630,25 @@ export function isRuffleEmulationSupported(
   return ["flash", "browser"].includes(slug.toLowerCase());
 }
 
+/**
+ * Check if Parchment emulation is supported for a given platform.
+ *
+ * @param platformSlug The platform slug.
+ * @param heartbeat The heartbeat object.
+ * @param config Optional configuration object.
+ * @returns True if supported, false otherwise.
+ */
+export function isParchmentEmulationSupported(
+  platformSlug: string,
+  heartbeat: Heartbeat,
+  config?: Config,
+) {
+  // if (heartbeat.EMULATION.DISABLE_PARCHMENT) return false;
+
+  const slug = config?.PLATFORMS_VERSIONS[platformSlug] || platformSlug;
+  return ["z-machine"].includes(slug.toLowerCase());
+}
+
 export type PlayingStatus =
   | RomUserStatus
   | "backlogged"

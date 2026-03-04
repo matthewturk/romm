@@ -12,7 +12,11 @@ import storeConfig from "@/stores/config";
 import storeHeartbeat from "@/stores/heartbeat";
 import storeRoms, { type SimpleRom } from "@/stores/roms";
 import type { Events } from "@/types/emitter";
-import { isEJSEmulationSupported, isRuffleEmulationSupported } from "@/utils";
+import {
+  isEJSEmulationSupported,
+  isRuffleEmulationSupported,
+  isParchmentEmulationSupported,
+} from "@/utils";
 
 const props = defineProps<{ rom: SimpleRom; iconEmbedded?: boolean }>();
 const attrs = useAttrs();
@@ -32,6 +36,11 @@ const isEmulationSupported = computed(() => {
       config.value,
     ) ||
     isRuffleEmulationSupported(
+      props.rom.platform_slug,
+      heartbeat.value,
+      config.value,
+    ) ||
+    isParchmentEmulationSupported(
       props.rom.platform_slug,
       heartbeat.value,
       config.value,
@@ -67,27 +76,27 @@ async function goToPlayer(rom: SimpleRom) {
       name: ROUTES.RUFFLE,
       params: { rom: rom.id },
     });
+  } else if (
+    isParchmentEmulationSupported(
+      rom.platform_slug,
+      heartbeat.value,
+      config.value,
+    )
+  ) {
+    await router.push({
+      name: ROUTES.PARCHMENT,
+      params: { rom: rom.id },
+    });
   }
 }
 </script>
 
 <template>
   <template v-if="isEmulationSupported">
-    <v-btn
-      v-if="iconEmbedded"
-      v-bind="attrs"
-      :disabled="rom.missing_from_fs"
-      :aria-label="`Play ${rom.name}`"
-      icon="mdi-play"
-      @click="goToPlayer(rom)"
-    />
-    <v-btn
-      v-else
-      v-bind="attrs"
-      :disabled="rom.missing_from_fs"
-      :aria-label="`Play ${rom.name}`"
-      @click="goToPlayer(rom)"
-    >
+    <v-btn v-if="iconEmbedded" v-bind="attrs" :disabled="rom.missing_from_fs" :aria-label="`Play ${rom.name}`"
+      icon="mdi-play" @click="goToPlayer(rom)" />
+    <v-btn v-else v-bind="attrs" :disabled="rom.missing_from_fs" :aria-label="`Play ${rom.name}`"
+      @click="goToPlayer(rom)">
       <v-icon>mdi-play</v-icon>
     </v-btn>
   </template>
