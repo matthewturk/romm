@@ -1,44 +1,40 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue';
+import { useScriptTag } from '@vueuse/core';
 import { getDownloadPath } from '@/utils';
 import type { DetailedRom } from '@/stores/roms';
+import '@/assets/parchment-scoped.css';
 
 const props = defineProps<{
     rom: DetailedRom;
 }>();
 
-const addedScripts: HTMLScriptElement[] = [];
-let addedLink: HTMLLinkElement | null = null;
+// Manage global scripts via VueUse
+// We need jQuery before Parchment
+// Note: useScriptTag handles mounting and removing scripts from DOM on component unmount automatically if not manual?
+// Documentation says: "Automatically load the script on mount, and unload on unmount."
+// BUT since we need sequential loading (jQuery then Parchment), we use manual loading.
+// When manual: true, unloading is also manual unless we manage lifecycle.
+// However, `useScriptTag` returns an `unload` function. We should call it.
 
-const loadScript = (src: string): Promise<void> => {
-    return new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = src;
-        script.async = false;
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
-        document.head.appendChild(script);
-        addedScripts.push(script);
-    });
-};
+const jqueryScript = useScriptTag(
+    '/assets/parchment/jquery.min.js',
+    () => { /* Loaded */ },
+    { manual: true }
+);
 
-const loadCSS = (href: string): HTMLLinkElement => {
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = href;
-    document.head.appendChild(link);
-    return link;
-};
+const parchmentScript = useScriptTag(
+    '/assets/parchment/parchment.js',
+    () => { /* Loaded */ },
+    { manual: true }
+);
 
-// Use defineExpose only if we need to expose methods, otherwise just setup logic
 onMounted(async () => {
-    // 1. Load CSS
-    addedLink = loadCSS('/assets/parchment/parchment.css');
-
-    // 2. Configure Parchment Options
+    // Configure Parchment Options
     const romUrl = getDownloadPath({ rom: props.rom });
 
     // Set global options for Parchment
+    // We attach to window as required by the library
     (window as any).parchment_options = {
         default_story: [romUrl],
         lib_path: '/assets/parchment/',
@@ -46,39 +42,29 @@ onMounted(async () => {
         // auto_launch: true // Default behavior launches the story
     };
 
-    // 3. Load Scripts
+    // Load Scripts Sequentially
     try {
-        // jQuery is a dependency for parchment.js
-        await loadScript('/assets/parchment/jquery.min.js');
-        // Main parchment library
-        await loadScript('/assets/parchment/parchment.js');
-        // Optional resource map if needed
-        // await loadScript('/assets/parchment/resourcemap.js');
+        await jqueryScript.load();
+        await parchmentScript.load();
     } catch (err) {
         console.error('Error loading Parchment scripts:', err);
     }
 });
 
 onUnmounted(() => {
-    // Cleanup scripts and styles
-    if (addedLink && document.head.contains(addedLink)) {
-        document.head.removeChild(addedLink);
-    }
-    addedScripts.forEach(script => {
-        if (document.head.contains(script)) {
-            document.head.removeChild(script);
-        }
-    });
+    // Unload scripts to clean up DOM
+    jqueryScript.unload();
+    parchmentScript.unload();
 
     // Clean up global options
     if ((window as any).parchment_options) delete (window as any).parchment_options;
-    // We might want to remove 'parchment' global if it exists, though it might persist
+    // Attempt to cleanup Parchment global instance if it exists
     if ((window as any).parchment) delete (window as any).parchment;
 });
 </script>
 
 <template>
-    <div class="parchment-container">
+    <div id="parchment-root" class="parchment-container">
         <!-- 
             Parchment expects specific IDs in the DOM.
             We provide the container structure as per manifest.txt
@@ -107,6 +93,8 @@ onUnmounted(() => {
     height: 100%;
     position: relative;
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
 }
 
 /* Ensure the gameport takes full size */
@@ -114,5 +102,6 @@ onUnmounted(() => {
     width: 100%;
     height: 100%;
     background-color: #f0f0f0;
+    flex: 1;
 }
 </style>

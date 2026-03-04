@@ -20,8 +20,8 @@
   ],
   "type": "module",
   "scripts": {
-    "dev": "vite --host",
-    "build": "vite build",
+    "dev": "node scripts/encapsulate-parchment.cjs && vite --host",
+    "build": "node scripts/encapsulate-parchment.cjs && vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
     "generate": "openapi --input http://127.0.0.1:3000/openapi.json --output ./src/__generated__ --client axios --useOptions --useUnionTypes --exportServices false --exportSchemas false --exportCore false",
