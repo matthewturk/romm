@@ -249,11 +249,43 @@ onMounted(async () => {
         console.error('Error loading Parchment scripts:', err);
     }
 
+    // Force dialogs into the container using MutationObserver
+    // This is necessary because AsyncGlk appends dialogs to document.body by default,
+    // which breaks fullscreen mode (dialogs become invisible) and scoped styling.
+    const observer = new MutationObserver((mutations) => {
+        const root = document.getElementById('parchment-root');
+        if (!root) return;
+
+        mutations.forEach((mutation) => {
+            if (mutation.type === 'childList') {
+                mutation.addedNodes.forEach((node) => {
+                    if (node instanceof HTMLDialogElement) {
+                        // Check if it's an AsyncGlk dialog (optional check, but safer)
+                        // It usually has classes like 'svelte-...' or just check tag
+                        console.log('[RomM] Detected dialog on body, moving to #parchment-root');
+                        root.appendChild(node);
+                    }
+                });
+            }
+        });
+    });
+
+    observer.observe(document.body, { childList: true });
+
+    // Store observer to disconnect later
+    (window as any)._parchmentObserver = observer;
+
     // @ts-ignore
     emitter?.on("saveSelected", loadSave);
 });
 
 onUnmounted(() => {
+    // Disconnect observer
+    if ((window as any)._parchmentObserver) {
+        (window as any)._parchmentObserver.disconnect();
+        delete (window as any)._parchmentObserver;
+    }
+
     // Revoke object URL
     if (objectUrl) {
         URL.revokeObjectURL(objectUrl);

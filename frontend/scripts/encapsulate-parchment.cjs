@@ -96,6 +96,13 @@ function scopeCss(css, rootSelector) {
             if (replaced.includes(rootSelector)) {
               return replaced;
             }
+
+            // AsyncGlk/Parchment dialogs are appended to document.body, so they are outside #parchment-root.
+            // We need to ensure styles apply to them as well by adding a body-scoped selector.
+            if (replaced.includes("dialog")) {
+              return `${rootSelector} ${replaced}, body > ${replaced}`;
+            }
+
             // Space is important
             return `${rootSelector} ${replaced}`;
           })
@@ -118,7 +125,28 @@ const css = fs.readFileSync(inputFile, "utf-8");
 
 try {
   const scoped = scopeCss(css, "#parchment-root");
-  fs.writeFileSync(outputFile, scoped);
+
+  // Append custom overrides
+  const overrides = `
+/* Custom overrides for RomM Parchment integration */
+
+/* Apply max width setting to the buffer text area */
+#parchment-root .BufferWindowInner {
+  max-width: var(--glkote-content-max-width, none);
+  margin: 0 auto;
+}
+
+/* Ensure dialogs are centered */
+#parchment-root dialog, body > dialog {
+  margin: auto;
+  inset: 0;
+  max-height: fit-content;
+  max-width: fit-content;
+  position: fixed; /* Force fixed positioning similar to modal behavior */
+}
+`;
+
+  fs.writeFileSync(outputFile, scoped + overrides);
   console.log(`Successfully encapsulated CSS to ${outputFile}`);
 } catch (e) {
   console.error("Error scoping CSS:", e);
