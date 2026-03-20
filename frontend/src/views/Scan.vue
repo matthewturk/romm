@@ -17,6 +17,8 @@ import storeScanning from "@/stores/scanning";
 import { platformCategoryToIcon } from "@/utils";
 
 const LOCAL_STORAGE_METADATA_SOURCES_KEY = "scan.metadataSources";
+const LOCAL_STORAGE_LAUNCHBOX_REMOTE_ENABLED_KEY =
+  "scan.launchboxRemoteEnabled";
 const { t } = useI18n();
 const { xs, smAndDown } = useDisplay();
 const scanningStore = storeScanning();
@@ -67,10 +69,18 @@ const storedMetadataSources = useLocalStorage(
   LOCAL_STORAGE_METADATA_SOURCES_KEY,
   [] as string[],
 );
+const launchboxRemoteEnabled = useLocalStorage(
+  LOCAL_STORAGE_LAUNCHBOX_REMOTE_ENABLED_KEY,
+  true,
+);
 const metadataSources = ref<MetadataOption[]>(
   metadataOptions.value.filter(
     (m) => storedMetadataSources.value.includes(m.value) && !m.disabled,
   ) || heartbeat.getEnabledMetadataOptions(),
+);
+
+const isLaunchboxSelected = computed(() =>
+  metadataSources.value.some((s) => s.value === "launchbox"),
 );
 
 watch(metadataOptions, (newOptions) => {
@@ -80,16 +90,20 @@ watch(metadataOptions, (newOptions) => {
   );
 });
 
-// Adding each new scanned platform to panelIndex to be open by default
-watch(
-  scanningPlatforms,
-  () => {
-    panels.value = scanningPlatforms.value
-      .map((p, index) => (p.roms.length > 0 ? index : -1))
-      .filter((index) => index !== -1);
-  },
-  { deep: true },
+// Track which platforms have ROMs/firmware without a deep watch on the entire array.
+// The computed returns a stable string that only changes when a platform
+// transitions from 0→1+ ROMs/firmware (or back), so the watch fires O(n_platforms)
+// times rather than O(n_roms) times.
+const platformsWithRomsKey = computed(() =>
+  scanningPlatforms.value
+    .map((p) => (p.roms.length > 0 || p.firmware_count > 0 ? 1 : 0))
+    .join(""),
 );
+watch(platformsWithRomsKey, () => {
+  panels.value = scanningPlatforms.value
+    .map((p, index) => (p.roms.length > 0 || p.firmware_count > 0 ? index : -1))
+    .filter((index) => index !== -1);
+});
 
 const scanOptions = [
   {
@@ -138,6 +152,7 @@ async function scan() {
     platforms: platformsToScan.value,
     type: scanType.value,
     apis: metadataSources.value.map((s) => s.value),
+    launchbox_remote_enabled: launchboxRemoteEnabled.value,
   });
 }
 
@@ -362,6 +377,32 @@ async function stopScan() {
                   <v-avatar size="25" rounded="1">
                     <v-img :src="item.raw.logo_path" />
                   </v-avatar>
+                </template>
+
+                <template #append v-if="item.raw.value === 'launchbox'">
+                  <div class="d-flex align-center">
+                    <span
+                      class="text-caption text-primary text-medium-emphasis mr-4"
+                      :class="{ 'text-romm-gray': launchboxRemoteEnabled }"
+                    >
+                      Local
+                    </span>
+                    <v-switch
+                      v-model="launchboxRemoteEnabled"
+                      color="primary"
+                      density="compact"
+                      hide-details
+                      :disabled="!isLaunchboxSelected"
+                      @click.stop
+                      @mousedown.stop
+                    />
+                    <span
+                      class="text-caption text-primary text-medium-emphasis ml-4"
+                      :class="{ 'text-romm-gray': !launchboxRemoteEnabled }"
+                    >
+                      Cloud
+                    </span>
+                  </div>
                 </template>
               </v-list-item>
             </template>
@@ -606,6 +647,23 @@ async function stopScan() {
                 scanStats.identified_roms,
                 scanStats.scanned_roms,
               ),
+            })
+          }}</span>
+        </v-chip>
+        <v-chip
+          color="secondary"
+          size="small"
+          text-color="white"
+          class="ml-1 my-1"
+        >
+          <v-icon left> mdi-memory </v-icon>
+          <span v-if="xs" class="ml-2">{{
+            t("scan.firmware-scanned-n", scanStats.scanned_firmware)
+          }}</span>
+          <span v-else class="ml-2">{{
+            t("scan.firmware-scanned-with-details", {
+              n_scanned_firmware: scanStats.scanned_firmware,
+              n_new_firmware: scanStats.new_firmware,
             })
           }}</span>
         </v-chip>

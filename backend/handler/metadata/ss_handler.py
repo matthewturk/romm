@@ -86,7 +86,6 @@ class SSPlatform(TypedDict):
 class SSAgeRating(TypedDict):
     rating: str
     category: str
-    rating_cover_url: str
 
 
 class SSMetadataMedia(TypedDict):
@@ -118,12 +117,14 @@ class SSMetadataMedia(TypedDict):
     marquee_path: str | None
     logo_path: str | None
     video_path: str | None
+    video_normalized_path: str | None
 
 
 class SSMetadata(SSMetadataMedia):
     ss_score: str | None
     first_release_date: int | None
     alternative_names: list[str]
+    age_ratings: list[SSAgeRating]
     companies: list[str]
     franchises: list[str]
     game_modes: list[str]
@@ -166,6 +167,7 @@ def extract_media_from_ss_game(rom: Rom, game: SSGame) -> SSMetadataMedia:
         marquee_path=None,
         logo_path=None,
         video_path=None,
+        video_normalized_path=None,
     )
 
     for region in get_preferred_regions():
@@ -294,6 +296,10 @@ def extract_media_from_ss_game(rom: Rom, game: SSGame) -> SSMetadataMedia:
                 ss_media["video_normalized_url"] = strip_sensitive_query_params(
                     media["url"], SENSITIVE_KEYS
                 )
+                if MetadataMediaType.VIDEO_NORMALIZED in preferred_media_types:
+                    ss_media["video_normalized_path"] = (
+                        f"{fs_resource_handler.get_media_resources_path(rom.platform_id, rom.id, MetadataMediaType.VIDEO_NORMALIZED)}/video-normalized.mp4"
+                    )
 
     return ss_media
 
@@ -359,10 +365,21 @@ def extract_metadata_from_ss_rom(rom: Rom, game: SSGame) -> SSMetadata:
             return "1"
         return str(player_count)
 
+    def _get_age_ratings(game: SSGame) -> list[SSAgeRating]:
+        return [
+            SSAgeRating(
+                rating=classification["text"],
+                category=classification["type"],
+            )
+            for classification in game.get("classifications", [])
+            if classification.get("type") and classification.get("text")
+        ]
+
     return SSMetadata(
         {
             "ss_score": _normalize_score(game.get("note", {}).get("text", "")),
             "alternative_names": [name["text"] for name in game.get("noms", [])],
+            "age_ratings": _get_age_ratings(game),
             "companies": pydash.compact(
                 [
                     game.get("editeur", {}).get("text"),

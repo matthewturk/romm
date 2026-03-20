@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import NotRequired, TypedDict
 
 import pydash
+from anyio import Path as AnyioPath
 
 from adapters.services.retroachievements import RetroAchievementsService
 from adapters.services.retroachievements_types import (
@@ -73,6 +74,7 @@ class RAUserGameProgression(TypedDict):
     num_awarded: int | None
     num_awarded_hardcore: int | None
     most_recent_awarded_date: NotRequired[str | None]
+    highest_award_kind: NotRequired[str | None]
     earned_achievements: list[EarnedAchievement]
 
 
@@ -169,7 +171,8 @@ class RAHandler(MetadataHandler):
             return REFRESH_RETROACHIEVEMENTS_CACHE_DAYS + 1
 
         full_path = fs_resource_handler.validate_path(file_path)
-        return int((time.time() - os.path.getmtime(full_path)) / (24 * 3600))
+        file_stat = await AnyioPath(str(full_path)).stat()
+        return int((time.time() - file_stat.st_mtime) / (24 * 3600))
 
     async def _search_rom(self, rom: Rom, ra_hash: str) -> RAGameListItem | None:
         if not rom.platform.ra_id:
@@ -326,6 +329,7 @@ class RAHandler(MetadataHandler):
 
         async for rom in self.ra_service.iter_user_completion_progress(username):
             rom_game_id = rom.get("GameID")
+            highest_award_kind = rom.get("HighestAwardKind", None)
 
             # If we have current progression data, and number of awarded achievements and most
             # recent awarded date match, then we can skip fetching progression details.
@@ -338,6 +342,15 @@ class RAHandler(MetadataHandler):
                 and rom["MostRecentAwardedDate"]
                 == game_current_progression.get("most_recent_awarded_date")
             ):
+                # Always keep highest_award_kind up-to-date even for cached progressions
+                if (
+                    game_current_progression.get("highest_award_kind")
+                    != highest_award_kind
+                ):
+                    game_current_progression = {
+                        **game_current_progression,
+                        "highest_award_kind": highest_award_kind,
+                    }
                 game_progressions.append(game_current_progression)
                 continue
 
@@ -367,6 +380,7 @@ class RAHandler(MetadataHandler):
                     num_awarded=rom.get("NumAwarded", None),
                     num_awarded_hardcore=rom.get("NumAwardedHardcore", None),
                     most_recent_awarded_date=rom.get("MostRecentAwardedDate", None),
+                    highest_award_kind=highest_award_kind,
                     earned_achievements=earned_achievements,
                 )
             )
@@ -450,6 +464,7 @@ RA_PLATFORM_LIST: dict[UPS, SlugToRAId] = {
         "name": "Watara/QuickShot Supervision",
     },
     UPS.WIN: {"id": 102, "name": "Windows"},
+    UPS.WII: {"id": 19, "name": "Wii"},
     UPS.WONDERSWAN: {"id": 53, "name": "WonderSwan"},
     UPS.WONDERSWAN_COLOR: {"id": 53, "name": "WonderSwan Color"},
 }

@@ -4,7 +4,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.testclient import TestClient
 from main import app
 
-from endpoints.auth import ACCESS_TOKEN_EXPIRE_MINUTES
+from config import OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 from handler.auth.constants import EDIT_SCOPES
 
 
@@ -27,7 +27,7 @@ def test_refreshing_oauth_token_basic(client, refresh_token):
     body = response.json()
     assert body["access_token"]
     assert body["token_type"] == "bearer"
-    assert body["expires"] == ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    assert body["expires"] == OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 
 
 def test_refreshing_oauth_token_without_refresh_token(client):
@@ -57,6 +57,45 @@ def test_refreshing_oauth_token_with_invalid_refresh_token(client):
         assert e.detail == "Invalid refresh token"
 
 
+def test_refresh_token_rotation_invalidates_old_token(client, refresh_token):
+    first_response = client.post(
+        "/api/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+    )
+
+    assert first_response.status_code == status.HTTP_200_OK
+    first_body = first_response.json()
+
+    assert first_body["access_token"]
+    assert first_body["refresh_token"]
+    assert first_body["refresh_token"] != refresh_token
+
+    new_refresh_token = first_body["refresh_token"]
+
+    second_response = client.post(
+        "/api/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+    )
+
+    assert second_response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    third_response = client.post(
+        "/api/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": new_refresh_token,
+        },
+    )
+
+    assert third_response.status_code == status.HTTP_200_OK
+
+
 def test_auth_via_upass(client, admin_user):
     response = client.post(
         "/api/token",
@@ -72,7 +111,7 @@ def test_auth_via_upass(client, admin_user):
     assert body["access_token"]
     assert body["refresh_token"]
     assert body["token_type"] == "bearer"
-    assert body["expires"] == ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    assert body["expires"] == OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 
 
 def test_auth_via_upass_with_invalid_credentials(client, admin_user):
@@ -117,3 +156,17 @@ def test_auth_with_invalid_grant_type(client):
     except HTTPException as e:
         assert e.status_code == status.HTTP_400_BAD_REQUEST
         assert e.detail == "Invalid or unsupported grant type"
+
+
+def test_refreshing_oauth_token_expired_refresh_token(
+    client, admin_user, expired_refresh_token
+):
+    response = client.post(
+        "/api/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": expired_refresh_token,
+        },
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED

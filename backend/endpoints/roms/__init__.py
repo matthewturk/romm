@@ -12,8 +12,9 @@ import pydash
 from anyio import Path, open_file
 from fastapi import (
     Body,
+    Depends,
     File,
-    Header,
+    Form,
     HTTPException,
 )
 from fastapi import Path as PathVar
@@ -23,15 +24,11 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.datastructures import FormData
 from fastapi.responses import Response
 from fastapi_pagination.ext.sqlalchemy import paginate
 from fastapi_pagination.limit_offset import LimitOffsetPage, LimitOffsetParams
-from pydantic import BaseModel
-from starlette.requests import ClientDisconnect
+from pydantic import BaseModel, Field
 from starlette.responses import FileResponse
-from streaming_form_data import StreamingFormDataParser
-from streaming_form_data.targets import FileTarget, NullTarget
 
 from config import (
     DEV_MODE,
@@ -42,16 +39,14 @@ from decorators.auth import protected_route
 from endpoints.responses import BulkOperationResponse
 from endpoints.responses.rom import (
     DetailedRomSchema,
-    RomFileSchema,
     RomFiltersDict,
     RomUserSchema,
     SimpleRomSchema,
-    UserNoteSchema,
 )
 from exceptions.endpoint_exceptions import RomNotFoundInDatabaseException
 from exceptions.fs_exceptions import RomAlreadyExistsException
 from handler.auth.constants import Scope
-from handler.database import db_platform_handler, db_rom_handler
+from handler.database import db_rom_handler
 from handler.database.base_handler import sync_session
 from handler.filesystem import fs_resource_handler, fs_rom_handler
 from handler.metadata import (
@@ -66,17 +61,27 @@ from handler.metadata.ss_handler import get_preferred_media_types
 from logger.formatter import BLUE
 from logger.formatter import highlight as hl
 from logger.logger import log
-from models.rom import Rom, RomNote
+from models.rom import Rom, RomUserStatus
 from utils.database import safe_int, safe_str_to_bool
 from utils.filesystem import sanitize_filename
 from utils.hashing import crc32_to_hex
 from utils.nginx import FileRedirectResponse, ZipContentLine, ZipResponse
 from utils.router import APIRouter
+from utils.validation import ValidationError
+
+from .files import router as files_router
+from .manual import router as manual_router
+from .notes import router as notes_router
+from .upload import router as upload_router
 
 router = APIRouter(
     prefix="/roms",
     tags=["roms"],
 )
+router.include_router(upload_router)
+router.include_router(files_router)
+router.include_router(manual_router)
+router.include_router(notes_router)
 
 
 def safe_int_or_none(value: Any) -> int | None:
@@ -86,8 +91,156 @@ def safe_int_or_none(value: Any) -> int | None:
     return safe_int(value)
 
 
-def parse_raw_metadata(data: FormData, form_key: str) -> dict | None:
-    raw_json = data.get(form_key, None)
+class RomUpdateForm(BaseModel):
+    igdb_id: str | None = Field(default=None, description="IGDB game ID.")
+    sgdb_id: str | None = Field(default=None, description="SteamGridDB game ID.")
+    moby_id: str | None = Field(default=None, description="MobyGames game ID.")
+    ss_id: str | None = Field(default=None, description="ScreenScraper game ID.")
+    ra_id: str | None = Field(default=None, description="RetroAchievements game ID.")
+    launchbox_id: str | None = Field(default=None, description="LaunchBox game ID.")
+    hasheous_id: str | None = Field(default=None, description="Hasheous game ID.")
+    tgdb_id: str | None = Field(default=None, description="TheGamesDB game ID.")
+    flashpoint_id: str | None = Field(default=None, description="Flashpoint game ID.")
+    hltb_id: str | None = Field(default=None, description="HowLongToBeat game ID.")
+    raw_igdb_metadata: str | None = Field(
+        default=None, description="Raw IGDB metadata as JSON string."
+    )
+    raw_moby_metadata: str | None = Field(
+        default=None, description="Raw MobyGames metadata as JSON string."
+    )
+    raw_ss_metadata: str | None = Field(
+        default=None, description="Raw ScreenScraper metadata as JSON string."
+    )
+    raw_launchbox_metadata: str | None = Field(
+        default=None, description="Raw LaunchBox metadata as JSON string."
+    )
+    raw_hasheous_metadata: str | None = Field(
+        default=None, description="Raw Hasheous metadata as JSON string."
+    )
+    raw_flashpoint_metadata: str | None = Field(
+        default=None, description="Raw Flashpoint metadata as JSON string."
+    )
+    raw_hltb_metadata: str | None = Field(
+        default=None, description="Raw HowLongToBeat metadata as JSON string."
+    )
+    raw_manual_metadata: str | None = Field(
+        default=None, description="Raw manual metadata as JSON string."
+    )
+    name: str | None = None
+    summary: str | None = None
+    fs_name: str | None = None
+    url_cover: str | None = None
+    url_manual: str | None = None
+
+
+class RomUserData(BaseModel):
+    is_main_sibling: bool | None = Field(
+        default=None, description="Whether this rom is the main sibling."
+    )
+    backlogged: bool | None = Field(
+        default=None, description="Whether this rom is in the backlog."
+    )
+    now_playing: bool | None = Field(
+        default=None, description="Whether this rom is currently being played."
+    )
+    hidden: bool | None = Field(default=None, description="Whether this rom is hidden.")
+    rating: int | None = Field(
+        default=None, description="User rating for this rom (0-10).", ge=0, le=10
+    )
+    difficulty: int | None = Field(
+        default=None,
+        description="User difficulty rating for this rom (0-10).",
+        ge=0,
+        le=10,
+    )
+    completion: int | None = Field(
+        default=None,
+        description="User completion percentage for this rom (0-100).",
+        ge=0,
+        le=100,
+    )
+    status: RomUserStatus | None = Field(
+        default=None, description="User play status for this rom."
+    )
+
+
+class RomUserUpdatePayload(BaseModel):
+    data: RomUserData = Field(
+        default_factory=RomUserData,
+        description="Partial rom user data to update. Only provided fields will be updated.",
+    )
+    update_last_played: bool = Field(
+        default=False, description="Set last played timestamp to now."
+    )
+    remove_last_played: bool = Field(
+        default=False, description="Clear the last played timestamp."
+    )
+
+
+async def parse_rom_update_form(
+    request: Request,
+    igdb_id: str | None = Form(default=None),
+    sgdb_id: str | None = Form(default=None),
+    moby_id: str | None = Form(default=None),
+    ss_id: str | None = Form(default=None),
+    ra_id: str | None = Form(default=None),
+    launchbox_id: str | None = Form(default=None),
+    hasheous_id: str | None = Form(default=None),
+    tgdb_id: str | None = Form(default=None),
+    flashpoint_id: str | None = Form(default=None),
+    hltb_id: str | None = Form(default=None),
+    raw_igdb_metadata: str | None = Form(default=None),
+    raw_moby_metadata: str | None = Form(default=None),
+    raw_ss_metadata: str | None = Form(default=None),
+    raw_launchbox_metadata: str | None = Form(default=None),
+    raw_hasheous_metadata: str | None = Form(default=None),
+    raw_flashpoint_metadata: str | None = Form(default=None),
+    raw_hltb_metadata: str | None = Form(default=None),
+    raw_manual_metadata: str | None = Form(default=None),
+    name: str | None = Form(default=None),
+    summary: str | None = Form(default=None),
+    fs_name: str | None = Form(default=None),
+    url_cover: str | None = Form(default=None),
+    url_manual: str | None = Form(default=None),
+) -> RomUpdateForm:
+    # Preserve "field was provided" behavior used by update logic.
+    form_keys = set((await request.form()).keys())
+    field_values = {
+        "igdb_id": igdb_id,
+        "sgdb_id": sgdb_id,
+        "moby_id": moby_id,
+        "ss_id": ss_id,
+        "ra_id": ra_id,
+        "launchbox_id": launchbox_id,
+        "hasheous_id": hasheous_id,
+        "tgdb_id": tgdb_id,
+        "flashpoint_id": flashpoint_id,
+        "hltb_id": hltb_id,
+        "raw_igdb_metadata": raw_igdb_metadata,
+        "raw_moby_metadata": raw_moby_metadata,
+        "raw_ss_metadata": raw_ss_metadata,
+        "raw_launchbox_metadata": raw_launchbox_metadata,
+        "raw_hasheous_metadata": raw_hasheous_metadata,
+        "raw_flashpoint_metadata": raw_flashpoint_metadata,
+        "raw_hltb_metadata": raw_hltb_metadata,
+        "raw_manual_metadata": raw_manual_metadata,
+        "name": name,
+        "summary": summary,
+        "fs_name": fs_name,
+        "url_cover": url_cover,
+        "url_manual": url_manual,
+    }
+
+    return RomUpdateForm.model_validate(
+        {field: value for field, value in field_values.items() if field in form_keys}
+    )
+
+
+def parse_raw_metadata(form_data: RomUpdateForm, form_key: str) -> dict | None:
+    if form_key not in form_data.model_fields_set:
+        return None
+
+    raw_json = getattr(form_data, form_key, None)
     if not raw_json or str(raw_json).strip() == "":
         return None
 
@@ -96,86 +249,6 @@ def parse_raw_metadata(data: FormData, form_key: str) -> dict | None:
     except json.JSONDecodeError as e:
         log.warning(f"Invalid JSON for {form_key}: {e}")
         return None
-
-
-@protected_route(
-    router.post,
-    "",
-    [Scope.ROMS_WRITE],
-    status_code=status.HTTP_201_CREATED,
-    responses={status.HTTP_400_BAD_REQUEST: {}},
-)
-async def add_rom(
-    request: Request,
-    platform_id: Annotated[
-        int,
-        Header(description="Platform internal id.", ge=1, alias="x-upload-platform"),
-    ],
-    filename: Annotated[
-        str,
-        Header(
-            description="The name of the file being uploaded.",
-            alias="x-upload-filename",
-        ),
-    ],
-) -> Response:
-    """Upload a single rom."""
-
-    if not platform_id or not filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No platform ID or filename provided",
-        )
-
-    db_platform = db_platform_handler.get_platform(platform_id)
-    if not db_platform:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Platform not found",
-        )
-
-    platform_fs_slug = db_platform.fs_slug
-    roms_path = fs_rom_handler.get_roms_fs_structure(platform_fs_slug)
-    log.info(
-        f"Uploading file to {hl(db_platform.custom_name or db_platform.name, color=BLUE)}[{hl(platform_fs_slug)}]"
-    )
-
-    file_location = fs_rom_handler.validate_path(f"{roms_path}/{filename}")
-
-    parser = StreamingFormDataParser(headers=request.headers)
-    parser.register("x-upload-platform", NullTarget())
-    parser.register(filename, FileTarget(str(file_location)))
-
-    # Check if the file already exists
-    if await fs_rom_handler.file_exists(f"{roms_path}/{filename}"):
-        log.warning(f" - Skipping {hl(filename)} since the file already exists")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File {filename} already exists",
-        )
-
-    # Create the directory if it doesn't exist
-    await fs_rom_handler.make_directory(roms_path)
-
-    def cleanup_partial_file():
-        if file_location.exists():
-            file_location.unlink()
-
-    try:
-        async for chunk in request.stream():
-            parser.data_received(chunk)
-    except ClientDisconnect:
-        log.error("Client disconnected during upload")
-        cleanup_partial_file()
-    except Exception as exc:
-        log.error("Error uploading files", exc_info=exc)
-        cleanup_partial_file()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="There was an error uploading the file(s)",
-        ) from exc
-
-    return Response()
 
 
 class CustomLimitOffsetParams(LimitOffsetParams):
@@ -870,6 +943,11 @@ async def get_rom_content(
         f"User {hl(current_username, color=BLUE)} is downloading {hl(rom.fs_name)}"
     )
 
+    # If .cue files are present, only list those in the M3U
+    # (avoids invalid entries like raw .bin tracks)
+    cue_files = [f for f in files if f.file_extension.lower() == "cue"]
+    m3u_files = cue_files if cue_files else files
+
     # Serve the file directly in development mode for emulatorjs
     if DEV_MODE:
         if len(files) == 1:
@@ -919,7 +997,7 @@ async def get_rom_content(
                 # Add M3U file if not already present
                 if not rom.has_m3u_file():
                     m3u_encoded_content = "\n".join(
-                        [f.file_name_for_download(hidden_folder) for f in files]
+                        [f.file_name_for_download(hidden_folder) for f in m3u_files]
                     ).encode()
                     m3u_filename = f"{rom.fs_name}.m3u"
                     m3u_info = ZipInfo(
@@ -962,7 +1040,7 @@ async def get_rom_content(
 
     if not rom.has_m3u_file():
         m3u_encoded_content = "\n".join(
-            [f.file_name_for_download(hidden_folder) for f in files]
+            [f.file_name_for_download(hidden_folder) for f in m3u_files]
         ).encode()
         m3u_base64_content = b64encode(m3u_encoded_content).decode()
         m3u_line = ZipContentLine(
@@ -988,6 +1066,7 @@ async def get_rom_content(
 async def update_rom(
     request: Request,
     id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
+    form_data: Annotated[RomUpdateForm, Depends(parse_rom_update_form)],
     artwork: Annotated[
         UploadFile | None,
         File(description="Custom artwork to set as cover."),
@@ -1002,8 +1081,6 @@ async def update_rom(
     ] = False,
 ) -> DetailedRomSchema:
     """Update a rom."""
-    data = await request.form()
-
     rom = db_rom_handler.get_rom(id)
 
     if not rom:
@@ -1051,50 +1128,69 @@ async def update_rom(
 
         return DetailedRomSchema.from_orm_with_request(rom, request)
 
+    provided_fields = form_data.model_fields_set
     cleaned_data: dict[str, Any] = {
         "igdb_id": (
-            safe_int_or_none(data["igdb_id"]) if "igdb_id" in data else rom.igdb_id
+            safe_int_or_none(form_data.igdb_id)
+            if "igdb_id" in provided_fields
+            else rom.igdb_id
         ),
         "sgdb_id": (
-            safe_int_or_none(data["sgdb_id"]) if "sgdb_id" in data else rom.sgdb_id
+            safe_int_or_none(form_data.sgdb_id)
+            if "sgdb_id" in provided_fields
+            else rom.sgdb_id
         ),
         "moby_id": (
-            safe_int_or_none(data["moby_id"]) if "moby_id" in data else rom.moby_id
+            safe_int_or_none(form_data.moby_id)
+            if "moby_id" in provided_fields
+            else rom.moby_id
         ),
-        "ss_id": safe_int_or_none(data["ss_id"]) if "ss_id" in data else rom.ss_id,
-        "ra_id": safe_int_or_none(data["ra_id"]) if "ra_id" in data else rom.ra_id,
+        "ss_id": (
+            safe_int_or_none(form_data.ss_id)
+            if "ss_id" in provided_fields
+            else rom.ss_id
+        ),
+        "ra_id": (
+            safe_int_or_none(form_data.ra_id)
+            if "ra_id" in provided_fields
+            else rom.ra_id
+        ),
         "launchbox_id": (
-            safe_int_or_none(data["launchbox_id"])
-            if "launchbox_id" in data
+            safe_int_or_none(form_data.launchbox_id)
+            if "launchbox_id" in provided_fields
             else rom.launchbox_id
         ),
         "hasheous_id": (
-            safe_int_or_none(data["hasheous_id"])
-            if "hasheous_id" in data
+            safe_int_or_none(form_data.hasheous_id)
+            if "hasheous_id" in provided_fields
             else rom.hasheous_id
         ),
         "tgdb_id": (
-            safe_int_or_none(data["tgdb_id"]) if "tgdb_id" in data else rom.tgdb_id
+            safe_int_or_none(form_data.tgdb_id)
+            if "tgdb_id" in provided_fields
+            else rom.tgdb_id
         ),
         "flashpoint_id": (
-            data["flashpoint_id"] or None
-            if "flashpoint_id" in data
+            form_data.flashpoint_id or None
+            if "flashpoint_id" in provided_fields
             else rom.flashpoint_id
         ),
         "hltb_id": (
-            safe_int_or_none(data["hltb_id"]) if "hltb_id" in data else rom.hltb_id
+            safe_int_or_none(form_data.hltb_id)
+            if "hltb_id" in provided_fields
+            else rom.hltb_id
         ),
     }
 
     # Add raw metadata parsing
-    raw_igdb_metadata = parse_raw_metadata(data, "raw_igdb_metadata")
-    raw_moby_metadata = parse_raw_metadata(data, "raw_moby_metadata")
-    raw_ss_metadata = parse_raw_metadata(data, "raw_ss_metadata")
-    raw_launchbox_metadata = parse_raw_metadata(data, "raw_launchbox_metadata")
-    raw_hasheous_metadata = parse_raw_metadata(data, "raw_hasheous_metadata")
-    raw_flashpoint_metadata = parse_raw_metadata(data, "raw_flashpoint_metadata")
-    raw_hltb_metadata = parse_raw_metadata(data, "raw_hltb_metadata")
-    raw_manual_metadata = parse_raw_metadata(data, "raw_manual_metadata")
+    raw_igdb_metadata = parse_raw_metadata(form_data, "raw_igdb_metadata")
+    raw_moby_metadata = parse_raw_metadata(form_data, "raw_moby_metadata")
+    raw_ss_metadata = parse_raw_metadata(form_data, "raw_ss_metadata")
+    raw_launchbox_metadata = parse_raw_metadata(form_data, "raw_launchbox_metadata")
+    raw_hasheous_metadata = parse_raw_metadata(form_data, "raw_hasheous_metadata")
+    raw_flashpoint_metadata = parse_raw_metadata(form_data, "raw_flashpoint_metadata")
+    raw_hltb_metadata = parse_raw_metadata(form_data, "raw_hltb_metadata")
+    raw_manual_metadata = parse_raw_metadata(form_data, "raw_manual_metadata")
     if cleaned_data["igdb_id"] and raw_igdb_metadata is not None:
         cleaned_data["igdb_metadata"] = raw_igdb_metadata
     if cleaned_data["moby_id"] and raw_moby_metadata is not None:
@@ -1120,7 +1216,8 @@ async def update_rom(
         flashpoint_rom = await meta_flashpoint_handler.get_rom_by_id(
             cleaned_data["flashpoint_id"]
         )
-        cleaned_data.update(flashpoint_rom)
+        if flashpoint_rom.get("flashpoint_id"):
+            cleaned_data.update(flashpoint_rom)
     elif rom.flashpoint_id and not cleaned_data["flashpoint_id"]:
         cleaned_data.update({"flashpoint_id": None, "flashpoint_metadata": {}})
 
@@ -1131,13 +1228,15 @@ async def update_rom(
         launchbox_rom = await meta_launchbox_handler.get_rom_by_id(
             cleaned_data["launchbox_id"]
         )
-        cleaned_data.update(launchbox_rom)
+        if launchbox_rom.get("launchbox_id"):
+            cleaned_data.update(launchbox_rom)
     elif rom.launchbox_id and not cleaned_data["launchbox_id"]:
         cleaned_data.update({"launchbox_id": None, "launchbox_metadata": {}})
 
     if cleaned_data["ra_id"] and int(cleaned_data["ra_id"]) != rom.ra_id:
         ra_rom = await meta_ra_handler.get_rom_by_id(rom, ra_id=cleaned_data["ra_id"])
-        cleaned_data.update(ra_rom)
+        if ra_rom.get("ra_id"):
+            cleaned_data.update(ra_rom)
     elif rom.ra_id and not cleaned_data["ra_id"]:
         cleaned_data.update({"ra_id": None, "ra_metadata": {}})
 
@@ -1145,42 +1244,51 @@ async def update_rom(
         moby_rom = await meta_moby_handler.get_rom_by_id(
             int(cleaned_data.get("moby_id", ""))
         )
-        cleaned_data.update(moby_rom)
+        if moby_rom.get("moby_id"):
+            cleaned_data.update(moby_rom)
     elif rom.moby_id and not cleaned_data["moby_id"]:
         cleaned_data.update({"moby_id": None, "moby_metadata": {}})
 
     if cleaned_data["ss_id"] and int(cleaned_data["ss_id"]) != rom.ss_id:
         ss_rom = await meta_ss_handler.get_rom_by_id(rom, cleaned_data["ss_id"])
-        cleaned_data.update(ss_rom)
+        if ss_rom.get("ss_id"):
+            cleaned_data.update(ss_rom)
     elif rom.ss_id and not cleaned_data["ss_id"]:
         cleaned_data.update({"ss_id": None, "ss_metadata": {}})
 
     if cleaned_data["igdb_id"] and int(cleaned_data["igdb_id"]) != rom.igdb_id:
         igdb_rom = await meta_igdb_handler.get_rom_by_id(cleaned_data["igdb_id"])
-        cleaned_data.update(igdb_rom)
+        if igdb_rom.get("igdb_id"):
+            cleaned_data.update(igdb_rom)
     elif rom.igdb_id and not cleaned_data["igdb_id"]:
         cleaned_data.update({"igdb_id": None, "igdb_metadata": {}})
 
     url_screenshots = cleaned_data.get("url_screenshots", [])
     screenshots_changed = pydash.xor(url_screenshots, rom.url_screenshots or [])
     if url_screenshots:
-        path_screenshots = await fs_resource_handler.get_rom_screenshots(
-            rom=rom,
-            overwrite=bool(screenshots_changed),
-            url_screenshots=cleaned_data.get("url_screenshots", []),
-        )
-        cleaned_data.update(
-            {"path_screenshots": path_screenshots, "url_screenshots": []}
-        )
+        try:
+            path_screenshots = await fs_resource_handler.get_rom_screenshots(
+                rom=rom,
+                overwrite=bool(screenshots_changed),
+                url_screenshots=cleaned_data.get("url_screenshots", []),
+            )
+            cleaned_data.update(
+                {"path_screenshots": path_screenshots, "url_screenshots": []}
+            )
+        except ValidationError as e:
+            log.error(f"Invalid screenshot URL in update_rom: {str(e)}")
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     cleaned_data.update(
         {
-            "name": data.get("name", rom.name),
-            "summary": data.get("summary", rom.summary),
+            "name": form_data.name if "name" in provided_fields else rom.name,
+            "summary": (
+                form_data.summary if "summary" in provided_fields else rom.summary
+            ),
         }
     )
 
-    new_fs_name = str(data.get("fs_name") or rom.fs_name)
+    new_fs_name = str(form_data.fs_name or rom.fs_name)
     new_fs_name = sanitize_filename(new_fs_name)
     cleaned_data.update(
         {
@@ -1212,32 +1320,44 @@ async def update_rom(
                 }
             )
         else:
-            url_cover = data.get("url_cover", rom.url_cover)
-            path_cover_s, path_cover_l = await fs_resource_handler.get_cover(
-                entity=rom,
-                overwrite=url_cover != rom.url_cover,
-                url_cover=str(url_cover),
+            url_cover = (
+                form_data.url_cover if "url_cover" in provided_fields else rom.url_cover
             )
-            cleaned_data.update(
-                {
-                    "url_cover": url_cover,
-                    "path_cover_s": path_cover_s,
-                    "path_cover_l": path_cover_l,
-                }
-            )
+            try:
+                path_cover_s, path_cover_l = await fs_resource_handler.get_cover(
+                    entity=rom,
+                    overwrite=url_cover != rom.url_cover,
+                    url_cover=str(url_cover),
+                )
+                cleaned_data.update(
+                    {
+                        "url_cover": url_cover,
+                        "path_cover_s": path_cover_s,
+                        "path_cover_l": path_cover_l,
+                    }
+                )
+            except ValidationError as e:
+                log.error(f"Invalid cover URL in update_rom: {str(e)}")
+                raise HTTPException(status_code=400, detail=str(e)) from e
 
-    url_manual = data.get("url_manual", rom.url_manual)
-    path_manual = await fs_resource_handler.get_manual(
-        rom=rom,
-        overwrite=url_manual != rom.url_manual,
-        url_manual=str(url_manual) if url_manual else None,
+    url_manual = (
+        form_data.url_manual if "url_manual" in provided_fields else rom.url_manual
     )
-    cleaned_data.update(
-        {
-            "url_manual": url_manual,
-            "path_manual": path_manual,
-        }
-    )
+    try:
+        path_manual = await fs_resource_handler.get_manual(
+            rom=rom,
+            overwrite=url_manual != rom.url_manual,
+            url_manual=str(url_manual) if url_manual else None,
+        )
+        cleaned_data.update(
+            {
+                "url_manual": url_manual,
+                "path_manual": path_manual,
+            }
+        )
+    except ValidationError as e:
+        log.error(f"Invalid manual URL in update_rom: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Handle RetroAchievements badges when the ID has changed
     if cleaned_data["ra_id"] and int(cleaned_data["ra_id"]) != rom.ra_id:
@@ -1311,128 +1431,6 @@ async def update_rom(
         raise RomNotFoundInDatabaseException(id)
 
     return DetailedRomSchema.from_orm_with_request(rom, request)
-
-
-@protected_route(
-    router.post,
-    "/{id}/manuals",
-    [Scope.ROMS_WRITE],
-    status_code=status.HTTP_201_CREATED,
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def add_rom_manuals(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-    filename: Annotated[
-        str,
-        Header(
-            description="The name of the file being uploaded.",
-            alias="x-upload-filename",
-        ),
-    ],
-) -> Response:
-    """Upload manuals for a rom."""
-
-    rom = db_rom_handler.get_rom(id)
-    if not rom:
-        raise RomNotFoundInDatabaseException(id)
-
-    manuals_path = f"{rom.fs_resources_path}/manual"
-    file_location = fs_resource_handler.validate_path(f"{manuals_path}/{rom.id}.pdf")
-    log.info(f"Uploading manual to {hl(str(file_location))}")
-
-    await fs_resource_handler.make_directory(manuals_path)
-
-    parser = StreamingFormDataParser(headers=request.headers)
-    parser.register("x-upload-platform", NullTarget())
-    parser.register(filename, FileTarget(str(file_location)))
-
-    def cleanup_partial_file():
-        if file_location.exists():
-            file_location.unlink()
-
-    try:
-        async for chunk in request.stream():
-            parser.data_received(chunk)
-
-        db_rom_handler.update_rom(
-            id,
-            {
-                "path_manual": f"{manuals_path}/{rom.id}.pdf",
-            },
-        )
-    except ClientDisconnect:
-        log.error("Client disconnected during upload")
-        cleanup_partial_file()
-    except Exception as exc:
-        log.error("Error uploading files", exc_info=exc)
-        cleanup_partial_file()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="There was an error uploading the manual",
-        ) from exc
-
-    return Response()
-
-
-@protected_route(
-    router.delete,
-    "/{id}/manuals",
-    [Scope.ROMS_WRITE],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def delete_rom_manuals(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-) -> Response:
-    """Delete manuals for a rom."""
-
-    rom = db_rom_handler.get_rom(id)
-    if not rom:
-        raise RomNotFoundInDatabaseException(id)
-
-    if not fs_resource_handler.manual_exists(rom):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No manual found for this ROM",
-        )
-
-    try:
-        await fs_resource_handler.remove_manual(rom)
-        db_rom_handler.update_rom(
-            id,
-            {
-                "path_manual": "",
-                "url_manual": "",
-            },
-        )
-
-        log.info(
-            f"Deleted manual for {hl(rom.name or 'ROM', color=BLUE)} [{hl(rom.fs_name)}]"
-        )
-    except FileNotFoundError:
-        log.warning(
-            f"Manual file not found for {hl(rom.name or 'ROM', color=BLUE)} [{hl(rom.fs_name)}]"
-        )
-        # Still update the database even if file doesn't exist
-        db_rom_handler.update_rom(
-            id,
-            {
-                "path_manual": "",
-                "url_manual": "",
-            },
-        )
-    except Exception as exc:
-        log.error(
-            f"Error deleting manual for {hl(rom.name or 'ROM', color=BLUE)} [{hl(rom.fs_name)}]",
-            exc_info=exc,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="There was an error deleting the manual",
-        ) from exc
-
-    return Response()
 
 
 @protected_route(
@@ -1519,21 +1517,9 @@ async def delete_roms(
 async def update_rom_user(
     request: Request,
     id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-    update_last_played: Annotated[
-        bool,
-        Body(description="Whether to update the last played date."),
-    ] = False,
-    remove_last_played: Annotated[
-        bool,
-        Body(description="Whether to remove the last played date."),
-    ] = False,
+    payload: Annotated[RomUserUpdatePayload, Body()],
 ) -> RomUserSchema:
     """Update rom data associated to the current user."""
-
-    # TODO: Migrate to native FastAPI body parsing.
-    data = await request.json()
-    rom_user_data = data.get("data", {})
-
     rom = db_rom_handler.get_rom(id)
 
     if not rom:
@@ -1543,241 +1529,13 @@ async def update_rom_user(
         id, request.user.id
     ) or db_rom_handler.add_rom_user(id, request.user.id)
 
-    fields_to_update = [
-        "is_main_sibling",
-        "backlogged",
-        "now_playing",
-        "hidden",
-        "rating",
-        "difficulty",
-        "completion",
-        "status",
-    ]
+    cleaned_data = payload.data.model_dump(exclude_unset=True)
 
-    cleaned_data = {
-        field: rom_user_data[field]
-        for field in fields_to_update
-        if field in rom_user_data
-    }
-
-    if update_last_played:
+    if payload.update_last_played:
         cleaned_data.update({"last_played": datetime.now(timezone.utc)})
-    elif remove_last_played:
+    elif payload.remove_last_played:
         cleaned_data.update({"last_played": None})
 
     rom_user = db_rom_handler.update_rom_user(db_rom_user.id, cleaned_data)
 
     return RomUserSchema.model_validate(rom_user)
-
-
-@protected_route(
-    router.get,
-    "/files/{id}",
-    [Scope.ROMS_READ],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def get_romfile(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom file internal id.", ge=1)],
-) -> RomFileSchema:
-    """Retrieve a rom file by ID."""
-
-    file = db_rom_handler.get_rom_file_by_id(id)
-    if not file:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found",
-        )
-
-    return RomFileSchema.model_validate(file)
-
-
-@protected_route(
-    router.get,
-    "files/{id}/content/{file_name}",
-    [] if DISABLE_DOWNLOAD_ENDPOINT_AUTH else [Scope.ROMS_READ],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def get_romfile_content(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom file internal id.", ge=1)],
-    file_name: Annotated[str, PathVar(description="File name to download")],
-):
-    """Download a rom file."""
-
-    current_username = (
-        request.user.username if request.user.is_authenticated else "unknown"
-    )
-
-    file = db_rom_handler.get_rom_file_by_id(id)
-    if not file:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="File not found",
-        )
-
-    log.info(f"User {hl(current_username, color=BLUE)} is downloading {hl(file_name)}")
-
-    # Serve the file directly in development mode for emulatorjs
-    if DEV_MODE:
-        rom_path = fs_rom_handler.validate_path(file.full_path)
-        return FileResponse(
-            path=rom_path,
-            filename=file_name,
-            headers={
-                "Content-Disposition": f"attachment; filename*=UTF-8''{quote(file_name)}; filename=\"{quote(file_name)}\"",
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(file.file_size_bytes),
-            },
-        )
-
-    # Otherwise proxy through nginx
-    return FileRedirectResponse(
-        download_path=Path(f"/library/{file.full_path}"),
-    )
-
-
-DEFAULT_PUBLIC_ONLY = Query(False, description="Only return public notes")
-DEFAULT_SEARCH = Query(None, description="Search notes by title or content")
-DEFAULT_TAGS = Query(None, description="Filter by tags")
-
-
-@protected_route(
-    router.get,
-    "/{id}/notes",
-    [Scope.ROMS_READ],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def get_rom_notes(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-    public_only: bool = DEFAULT_PUBLIC_ONLY,
-    search: str = DEFAULT_SEARCH,
-    tags: list[str] = DEFAULT_TAGS,
-) -> list[UserNoteSchema]:
-    """Get all notes for a ROM."""
-    rom = db_rom_handler.get_rom(id)
-    if not rom:
-        raise RomNotFoundInDatabaseException(id)
-
-    if tags is None:
-        tags = []
-
-    notes = db_rom_handler.get_rom_notes(
-        rom_id=id,
-        user_id=request.user.id,
-        public_only=public_only,
-        search=search,
-        tags=tags,
-    )
-
-    return [UserNoteSchema.model_validate(note) for note in notes]
-
-
-@protected_route(
-    router.get,
-    "/{id}/notes/identifiers",
-    [Scope.ROMS_READ],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def get_rom_note_identifiers(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-) -> list[int]:
-    """Get all note identifiers for a ROM."""
-    rom = db_rom_handler.get_rom(id)
-    if not rom:
-        raise RomNotFoundInDatabaseException(id)
-
-    notes = db_rom_handler.get_rom_notes(
-        rom_id=id,
-        user_id=request.user.id,
-        only_fields=[RomNote.id],
-    )
-
-    return [note.id for note in notes]
-
-
-@protected_route(
-    router.post,
-    "/{id}/notes",
-    [Scope.ROMS_USER_WRITE],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def create_rom_note(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-    note_data: Annotated[dict, Body()],
-) -> UserNoteSchema:
-    """Create a new note for a ROM."""
-    rom = db_rom_handler.get_rom(id)
-    if not rom:
-        raise RomNotFoundInDatabaseException(id)
-
-    note = db_rom_handler.create_rom_note(
-        rom_id=id,
-        user_id=request.user.id,
-        title=note_data["title"],
-        content=note_data.get("content", ""),
-        is_public=note_data.get("is_public", False),
-        tags=note_data.get("tags", []),
-    )
-
-    # Add username to the note data
-    note["username"] = request.user.username
-    return UserNoteSchema.model_validate(note)
-
-
-@protected_route(
-    router.put,
-    "/{id}/notes/{note_id}",
-    [Scope.ROMS_USER_WRITE],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def update_rom_note(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-    note_id: Annotated[int, PathVar(description="Note id.", ge=1)],
-    note_data: Annotated[dict, Body()],
-) -> UserNoteSchema:
-    """Update a ROM note."""
-    note = db_rom_handler.update_rom_note(
-        note_id=note_id,
-        user_id=request.user.id,
-        **{
-            k: v
-            for k, v in note_data.items()
-            if k in ["title", "content", "is_public", "tags"]
-        },
-    )
-
-    if not note:
-        raise HTTPException(
-            status_code=404, detail="Note not found or not owned by user"
-        )
-
-    # Add username to the note data
-    note["username"] = request.user.username
-    return UserNoteSchema.model_validate(note)
-
-
-@protected_route(
-    router.delete,
-    "/{id}/notes/{note_id}",
-    [Scope.ROMS_USER_WRITE],
-    responses={status.HTTP_404_NOT_FOUND: {}},
-)
-async def delete_rom_note(
-    request: Request,
-    id: Annotated[int, PathVar(description="Rom internal id.", ge=1)],
-    note_id: Annotated[int, PathVar(description="Note id.", ge=1)],
-) -> dict:
-    """Delete a ROM note."""
-    success = db_rom_handler.delete_rom_note(note_id=note_id, user_id=request.user.id)
-
-    if not success:
-        raise HTTPException(
-            status_code=404, detail="Note not found or not owned by user"
-        )
-
-    return {"message": "Note deleted successfully"}

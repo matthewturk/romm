@@ -8,7 +8,7 @@ from config import ASSETS_BASE_PATH
 from config.config_manager import config_manager as cm
 from endpoints.responses.rom import SimpleRomSchema
 from handler.database import db_platform_handler, db_rom_handler
-from handler.filesystem import fs_asset_handler, fs_firmware_handler
+from handler.filesystem import fs_asset_handler, fs_firmware_handler, fs_rom_handler
 from handler.filesystem.roms_handler import FSRom
 from handler.metadata import (
     meta_flashpoint_handler,
@@ -29,7 +29,8 @@ from handler.metadata.gamelist_handler import GamelistRom
 from handler.metadata.hasheous_handler import HASHEOUS_PLATFORM_LIST, HasheousRom
 from handler.metadata.hltb_handler import HLTB_PLATFORM_LIST, HLTBRom
 from handler.metadata.igdb_handler import IGDB_PLATFORM_LIST, IGDBRom
-from handler.metadata.launchbox_handler import LAUNCHBOX_PLATFORM_LIST, LaunchboxRom
+from handler.metadata.launchbox_handler.platforms import LAUNCHBOX_PLATFORM_LIST
+from handler.metadata.launchbox_handler.types import LaunchboxRom
 from handler.metadata.moby_handler import MOBYGAMES_PLATFORM_LIST, MobyGamesRom
 from handler.metadata.playmatch_handler import PlaymatchRomMatch
 from handler.metadata.ra_handler import RA_PLATFORM_LIST, RAGameRom
@@ -288,6 +289,7 @@ async def scan_rom(
     fs_rom: FSRom,
     metadata_sources: list[str],
     newly_added: bool,
+    launchbox_remote_enabled: bool = True,
     socket_manager: socketio.AsyncRedisManager | None = None,
 ) -> Rom:
     rom_attrs = {
@@ -592,12 +594,20 @@ async def scan_rom(
                 and rom.platform_slug in LAUNCHBOX_PLATFORM_LIST
             )
         ):
-            if scan_type == ScanType.UPDATE and rom.launchbox_id:
-                return await meta_launchbox_handler.get_rom_by_id(rom.launchbox_id)
-            else:
-                return await meta_launchbox_handler.get_rom(
-                    rom_attrs["fs_name"], platform_slug
+            if (
+                scan_type == ScanType.UPDATE
+                and rom.launchbox_id
+                and launchbox_remote_enabled
+            ):
+                return await meta_launchbox_handler.get_rom_by_id(
+                    rom.launchbox_id, remote_enabled=True
                 )
+
+            return await meta_launchbox_handler.get_rom(
+                rom_attrs["fs_name"],
+                platform_slug,
+                remote_enabled=launchbox_remote_enabled,
+            )
 
         return LaunchboxRom(launchbox_id=None)
 
@@ -754,6 +764,16 @@ async def scan_rom(
                 or [],
             }
         )
+
+    # Use PICO-8 cartridge PNG as cover art if no cover is set.
+    # PICO-8 .p8.png files are valid PNG images whose visual content is the
+    # cartridge label, so the ROM file itself serves as the cover art.
+    if not rom_attrs.get("url_cover") and not rom_attrs.get("path_cover_s"):
+        pico8_url = fs_rom_handler.get_pico8_cover_url(
+            platform.slug, rom_attrs["fs_name"], rom_attrs["fs_path"]
+        )
+        if pico8_url:
+            rom_attrs["url_cover"] = pico8_url
 
     # If not found in any metadata source, we return the rom with the default values
     if (

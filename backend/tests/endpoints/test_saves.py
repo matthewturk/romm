@@ -7,7 +7,7 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from main import app
 
-from endpoints.auth import ACCESS_TOKEN_EXPIRE_MINUTES
+from config import OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 from handler.auth import oauth_handler
 from handler.auth.constants import Scope
 from handler.database import db_device_handler, db_device_save_sync_handler
@@ -49,14 +49,13 @@ def token_without_device_scopes(admin_user: User):
         for s in admin_user.oauth_scopes
         if s not in (Scope.DEVICES_READ, Scope.DEVICES_WRITE)
     ]
-    return oauth_handler.create_oauth_token(
+    return oauth_handler.create_access_token(
         data={
             "sub": admin_user.username,
             "iss": "romm:oauth",
             "scopes": " ".join(scopes),
-            "type": "access",
         },
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        expires_delta=timedelta(seconds=OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS),
     )
 
 

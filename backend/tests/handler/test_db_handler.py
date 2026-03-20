@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import pytest
 from sqlalchemy.exc import IntegrityError
 
 from handler.auth import auth_handler
@@ -180,6 +181,170 @@ def test_filter_by_search_term_with_multiple_terms(platform: Platform):
     assert actual_rom_ids_single == expected_rom_ids_single
 
 
+def test_sibling_roms_empty_fs_name_no_tags_not_matched(platform: Platform):
+    """ROMs with empty fs_name_no_tags should NOT be matched as siblings.
+
+    Japanese ROMs often have names starting with region tags (e.g., "(Japan) Sonic Jam.iso"),
+    which results in an empty fs_name_no_tags. Without a guard, all such ROMs on the same
+    platform would incorrectly be matched as siblings of each other.
+    """
+    rom1 = db_rom_handler.add_rom(
+        Rom(
+            platform_id=platform.id,
+            name="(Japan) Game A",
+            slug="japan-game-a",
+            fs_name="(Japan) Game A.iso",
+            fs_name_no_tags="",  # Empty due to leading region tag
+            fs_name_no_ext="(Japan) Game A",
+            fs_extension="iso",
+            fs_path=f"{platform.slug}/roms",
+        )
+    )
+    rom2 = db_rom_handler.add_rom(
+        Rom(
+            platform_id=platform.id,
+            name="(Japan) Game B",
+            slug="japan-game-b",
+            fs_name="(Japan) Game B.iso",
+            fs_name_no_tags="",  # Empty due to leading region tag
+            fs_name_no_ext="(Japan) Game B",
+            fs_extension="iso",
+            fs_path=f"{platform.slug}/roms",
+        )
+    )
+
+    loaded_rom1 = db_rom_handler.get_rom(rom1.id)
+    loaded_rom2 = db_rom_handler.get_rom(rom2.id)
+    assert loaded_rom1 is not None
+    assert loaded_rom2 is not None
+
+    # ROMs with empty fs_name_no_tags should NOT be siblings of each other
+    sibling_ids1 = {s.id for s in loaded_rom1.sibling_roms}
+    sibling_ids2 = {s.id for s in loaded_rom2.sibling_roms}
+    assert rom2.id not in sibling_ids1
+    assert rom1.id not in sibling_ids2
+
+
+def test_sibling_roms_nonempty_fs_name_no_tags_matched(platform: Platform):
+    """ROMs with matching non-empty fs_name_no_tags SHOULD be matched as siblings.
+
+    For example, "Sonic Jam (USA).iso" and "Sonic Jam (Japan).iso" both have
+    fs_name_no_tags = "Sonic Jam" and should be considered siblings.
+    """
+    rom1 = db_rom_handler.add_rom(
+        Rom(
+            platform_id=platform.id,
+            name="Sonic Jam (USA)",
+            slug="sonic-jam-usa",
+            fs_name="Sonic Jam (USA).iso",
+            fs_name_no_tags="Sonic Jam",
+            fs_name_no_ext="Sonic Jam (USA)",
+            fs_extension="iso",
+            fs_path=f"{platform.slug}/roms",
+        )
+    )
+    rom2 = db_rom_handler.add_rom(
+        Rom(
+            platform_id=platform.id,
+            name="Sonic Jam (Japan)",
+            slug="sonic-jam-japan",
+            fs_name="Sonic Jam (Japan).iso",
+            fs_name_no_tags="Sonic Jam",
+            fs_name_no_ext="Sonic Jam (Japan)",
+            fs_extension="iso",
+            fs_path=f"{platform.slug}/roms",
+        )
+    )
+
+    loaded_rom1 = db_rom_handler.get_rom(rom1.id)
+    loaded_rom2 = db_rom_handler.get_rom(rom2.id)
+    assert loaded_rom1 is not None
+    assert loaded_rom2 is not None
+
+    # ROMs with same non-empty fs_name_no_tags should be siblings
+    sibling_ids1 = {s.id for s in loaded_rom1.sibling_roms}
+    sibling_ids2 = {s.id for s in loaded_rom2.sibling_roms}
+    assert rom2.id in sibling_ids1
+    assert rom1.id in sibling_ids2
+
+
+def test_group_by_meta_id_with_empty_fs_name_no_tags(platform: Platform):
+    """ROMs with empty fs_name_no_tags should each get their own group when using
+    group_by_meta_id, not be grouped into a single catch-all group.
+
+    Without the fix, all unmatched ROMs with empty fs_name_no_tags would be
+    grouped under "fs-<platform_id>-" and only 1 would be shown.
+    """
+    rom_names = ["(Japan) Game A", "(Japan) Game B", "(Japan) Game C"]
+    for name in rom_names:
+        db_rom_handler.add_rom(
+            Rom(
+                platform_id=platform.id,
+                name=name,
+                slug=name.lower().replace(" ", "-").replace("(", "").replace(")", ""),
+                fs_name=f"{name}.iso",
+                fs_name_no_tags="",  # Empty due to leading region tag
+                fs_name_no_ext=name,
+                fs_extension="iso",
+                fs_path=f"{platform.slug}/roms",
+            )
+        )
+
+    roms = db_rom_handler.get_roms_scalar(
+        platform_ids=[platform.id],
+        order_by="name",
+        order_dir="asc",
+        group_by_meta_id=True,
+    )
+    # All 3 ROMs should be shown, not collapsed into 1
+    assert len(roms) == len(rom_names)
+
+
+def test_natural_sort_order(platform: Platform):
+    """Numbers in names should sort numerically, not lexicographically."""
+    for name in ["Game 10", "Game 2", "Game 1"]:
+        db_rom_handler.add_rom(
+            Rom(
+                platform_id=platform.id,
+                name=name,
+                slug=name.lower().replace(" ", "-"),
+                fs_name=f"{name}.zip",
+                fs_name_no_tags=name,
+                fs_name_no_ext=name,
+                fs_extension="zip",
+                fs_path=f"{platform.slug}/roms",
+            )
+        )
+
+    roms = db_rom_handler.get_roms_scalar(
+        platform_ids=[platform.id], order_by="name", order_dir="asc"
+    )
+    assert [r.name for r in roms] == ["Game 1", "Game 2", "Game 10"]
+
+
+def test_article_stripping_sort(platform: Platform):
+    """Leading articles (the, a, an) are stripped when sorting, case-insensitively."""
+    for name in ["Zelda", "The Legend", "A Quest"]:
+        db_rom_handler.add_rom(
+            Rom(
+                platform_id=platform.id,
+                name=name,
+                slug=name.lower().replace(" ", "-"),
+                fs_name=f"{name}.zip",
+                fs_name_no_tags=name,
+                fs_name_no_ext=name,
+                fs_extension="zip",
+                fs_path=f"{platform.slug}/roms",
+            )
+        )
+
+    roms = db_rom_handler.get_roms_scalar(
+        platform_ids=[platform.id], order_by="name", order_dir="asc"
+    )
+    # "The Legend" → sorts as "legend", "A Quest" → "quest", "Zelda" → "zelda"
+    assert [r.name for r in roms] == ["The Legend", "A Quest", "Zelda"]
+
+
 def test_users(admin_user):
     db_user_handler.add_user(
         User(
@@ -208,16 +373,14 @@ def test_users(admin_user):
     all_users = db_user_handler.get_users()
     assert len(all_users) == 1
 
-    try:
-        new_user = db_user_handler.add_user(
+    with pytest.raises(IntegrityError):
+        db_user_handler.add_user(
             User(
                 username="test_admin",
                 hashed_password=auth_handler.get_password_hash("new_password"),
                 role=Role.ADMIN,
             )
         )
-    except IntegrityError as e:
-        assert "Duplicate entry 'test_admin' for key" in str(e)
 
 
 def test_saves(save: Save, platform: Platform, admin_user: User):

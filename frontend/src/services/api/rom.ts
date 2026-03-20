@@ -1,22 +1,95 @@
 import type { AxiosProgressEvent } from "axios";
 import type {
+  Body_delete_roms_api_roms_delete_post as DeleteRomsInput,
+  Body_update_rom_api_roms__id__put as UpdateRomInput,
   BulkOperationResponse,
+  DetailedRomSchema,
   ManualMetadata,
+  RomUserUpdatePayload,
   RomUserSchema,
+  SearchRomSchema,
+  SimpleRomSchema,
   UserNoteSchema,
   RomFiltersDict,
 } from "@/__generated__";
 import { type CustomLimitOffsetPage_SimpleRomSchema_ as GetRomsResponse } from "@/__generated__/models/CustomLimitOffsetPage_SimpleRomSchema_";
 import api from "@/services/api";
 import socket from "@/services/socket";
-import storeHeartbeat from "@/stores/heartbeat";
-import type { DetailedRom, SimpleRom, SearchRom } from "@/stores/roms";
 import storeUpload from "@/stores/upload";
 import { getDownloadPath } from "@/utils";
+import { buildFormInput, type FormInputField } from "@/utils/formData";
 
 export const romApi = api;
+type DetailedRom = DetailedRomSchema;
+type SimpleRom = SimpleRomSchema;
+type SearchRom = SearchRomSchema;
 
 const DOWNLOAD_CLEANUP_DELAY = 100;
+const UPLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
+const MAX_CHUNK_RETRIES = 3;
+
+async function uploadRomChunked({
+  platformId,
+  file,
+}: {
+  platformId: number;
+  file: File;
+}): Promise<void> {
+  const uploadStore = storeUpload();
+  const totalChunks = Math.ceil(file.size / UPLOAD_CHUNK_SIZE);
+
+  const { data: startData } = await api.post("/roms/upload/start", null, {
+    headers: {
+      "X-Upload-Platform": platformId.toString(),
+      "X-Upload-Filename": file.name,
+      "X-Upload-Total-Size": file.size.toString(),
+      "X-Upload-Total-Chunks": totalChunks.toString(),
+    },
+  });
+  const { upload_id } = startData;
+
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * UPLOAD_CHUNK_SIZE;
+    const chunk = file.slice(
+      start,
+      Math.min(start + UPLOAD_CHUNK_SIZE, file.size),
+    );
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_CHUNK_RETRIES; attempt++) {
+      try {
+        await api.put(`/roms/upload/${upload_id}`, chunk, {
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Chunk-Index": i.toString(),
+          },
+          timeout: 120000,
+          onUploadProgress: (progressEvent: AxiosProgressEvent) => {
+            const chunkFraction = progressEvent.progress ?? 0;
+            const overall = ((i + chunkFraction) / totalChunks) * 100;
+            uploadStore.updateChunkProgress(file.name, overall, file.size);
+          },
+        });
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err as Error;
+        if (attempt < MAX_CHUNK_RETRIES - 1) {
+          await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        }
+      }
+    }
+
+    if (lastError) {
+      await api.post(`/roms/upload/${upload_id}/cancel`).catch(() => {});
+      throw lastError;
+    }
+  }
+
+  await api.post(`/roms/upload/${upload_id}/complete`, null, {
+    timeout: 600000, // 10 minutes
+  });
+}
 
 async function uploadRoms({
   platformId,
@@ -24,39 +97,22 @@ async function uploadRoms({
 }: {
   platformId: number;
   filesToUpload: File[];
-}): Promise<PromiseSettledResult<null>[]> {
-  const heartbeat = storeHeartbeat();
-
+}) {
   if (!socket.connected) socket.connect();
   const uploadStore = storeUpload();
 
   const promises = filesToUpload.map((file) => {
-    const formData = new FormData();
-    formData.append(file.name, file);
-
     uploadStore.start(file.name);
-    return new Promise<null>((resolve, reject) => {
-      api
-        .post("/roms", formData, {
-          headers: {
-            "Content-Type": "multipart/form-data",
-            "X-Upload-Platform": platformId.toString(),
-            "X-Upload-Filename": file.name,
-          },
-          timeout: heartbeat.value.FRONTEND.UPLOAD_TIMEOUT * 1000,
-          params: {},
-          onUploadProgress: (progressEvent: AxiosProgressEvent) => {
-            uploadStore.update(file.name, progressEvent);
-          },
-        })
-        .then(() => {
-          resolve(null);
-        })
-        .catch((error) => {
-          uploadStore.fail(file.name, error.response?.data?.detail);
-          reject(error);
-        });
-    });
+
+    return uploadRomChunked({ platformId, file })
+      .then(() => null as null)
+      .catch((error) => {
+        uploadStore.fail(
+          file.name,
+          error.response?.data?.detail ?? error.message,
+        );
+        return Promise.reject(error);
+      });
   });
 
   return Promise.allSettled(promises);
@@ -116,9 +172,9 @@ async function getRoms({
   filterFavorites = null,
   filterDuplicates = null,
   filterPlayables = null,
-  filterRA = false,
-  filterMissing = false,
-  filterVerified = false,
+  filterRA = null,
+  filterMissing = null,
+  filterVerified = null,
   groupByMetaId = false,
   selectedGenres = null,
   selectedFranchises = null,
@@ -139,7 +195,7 @@ async function getRoms({
   languagesLogic = null,
   statusesLogic = null,
   playerCountsLogic = null,
-}: GetRomsParams): Promise<{ data: GetRomsResponse }> {
+}: GetRomsParams) {
   const params = {
     platform_ids:
       platformIds && platformIds.length > 0 ? platformIds : undefined,
@@ -232,7 +288,7 @@ async function getRoms({
     ...(filterVerified !== null ? { verified: filterVerified } : {}),
   };
 
-  return api.get(`/roms`, {
+  return api.get<GetRomsResponse>(`/roms`, {
     params,
   });
 }
@@ -240,8 +296,8 @@ async function getRoms({
 export const RECENT_ROMS_LIMIT = 15;
 export const RECENT_PLAYED_ROMS_LIMIT = 15;
 
-async function getRecentRoms(): Promise<{ data: GetRomsResponse }> {
-  return api.get("/roms", {
+async function getRecentRoms() {
+  return api.get<GetRomsResponse>("/roms", {
     params: {
       order_by: "id",
       order_dir: "desc",
@@ -252,8 +308,8 @@ async function getRecentRoms(): Promise<{ data: GetRomsResponse }> {
   });
 }
 
-async function getRecentPlayedRoms(): Promise<{ data: GetRomsResponse }> {
-  return api.get("/roms", {
+async function getRecentPlayedRoms() {
+  return api.get<GetRomsResponse>("/roms", {
     params: {
       order_by: "last_played",
       order_dir: "desc",
@@ -265,12 +321,8 @@ async function getRecentPlayedRoms(): Promise<{ data: GetRomsResponse }> {
   });
 }
 
-async function getRom({
-  romId,
-}: {
-  romId: number;
-}): Promise<{ data: DetailedRom }> {
-  return api.get(`/roms/${romId}`);
+async function getRom({ romId }: { romId: number }) {
+  return api.get<DetailedRom>(`/roms/${romId}`);
 }
 
 async function getRomByMetadataProvider({
@@ -279,8 +331,8 @@ async function getRomByMetadataProvider({
 }: {
   field: Partial<keyof DetailedRom>;
   id: number;
-}): Promise<{ data: DetailedRom }> {
-  return api.get(`/roms/by-metadata-provider/`, {
+}) {
+  return api.get<DetailedRom>(`/roms/by-metadata-provider/`, {
     params: { [field]: id },
   });
 }
@@ -293,8 +345,8 @@ async function searchRom({
   romId: number;
   searchTerm: string;
   searchBy: string;
-}): Promise<{ data: SearchRom[] }> {
-  return api.get("/search/roms", {
+}) {
+  return api.get<SearchRom[]>("/search/roms", {
     params: {
       rom_id: romId,
       search_term: searchTerm,
@@ -377,66 +429,67 @@ async function updateRom({
   rom: UpdateRom;
   removeCover?: boolean;
   unmatch?: boolean;
-}): Promise<{ data: DetailedRom }> {
-  const formData = new FormData();
-  formData.append("name", rom.name || "");
-  formData.append("fs_name", rom.fs_name);
-  formData.append("summary", rom.summary || "");
+}) {
+  const toFormIdValue = (value: number | string | null | undefined): string =>
+    value === null || value === undefined ? "" : String(value);
 
-  formData.append("igdb_id", rom.igdb_id?.toString() || "");
-  formData.append("sgdb_id", rom.sgdb_id?.toString() || "");
-  formData.append("moby_id", rom.moby_id?.toString() || "");
-  formData.append("ss_id", rom.ss_id?.toString() || "");
-  formData.append("launchbox_id", rom.launchbox_id?.toString() || "");
-  formData.append("ra_id", rom.ra_id?.toString() || "");
-  formData.append("flashpoint_id", rom.flashpoint_id?.toString() || "");
-  formData.append("hasheous_id", rom.hasheous_id?.toString() || "");
-  formData.append("tgdb_id", rom.tgdb_id?.toString() || "");
-  formData.append("hltb_id", rom.hltb_id?.toString() || "");
+  const fields: FormInputField<UpdateRomInput>[] = [
+    ["name", rom.name],
+    ["fs_name", rom.fs_name],
+    ["summary", rom.summary],
+    ["igdb_id", toFormIdValue(rom.igdb_id)],
+    ["sgdb_id", toFormIdValue(rom.sgdb_id)],
+    ["moby_id", toFormIdValue(rom.moby_id)],
+    ["ss_id", toFormIdValue(rom.ss_id)],
+    ["launchbox_id", toFormIdValue(rom.launchbox_id)],
+    ["ra_id", toFormIdValue(rom.ra_id)],
+    ["flashpoint_id", toFormIdValue(rom.flashpoint_id)],
+    ["hasheous_id", toFormIdValue(rom.hasheous_id)],
+    ["tgdb_id", toFormIdValue(rom.tgdb_id)],
+    ["hltb_id", toFormIdValue(rom.hltb_id)],
+  ];
 
   if (rom.manual_metadata) {
-    formData.append("raw_manual_metadata", JSON.stringify(rom.manual_metadata));
+    fields.push(["raw_manual_metadata", JSON.stringify(rom.manual_metadata)]);
   }
 
   if (rom.raw_metadata?.igdb_metadata) {
-    formData.append("raw_igdb_metadata", rom.raw_metadata.igdb_metadata);
+    fields.push(["raw_igdb_metadata", rom.raw_metadata.igdb_metadata]);
   }
   if (rom.raw_metadata?.moby_metadata) {
-    formData.append("raw_moby_metadata", rom.raw_metadata.moby_metadata);
+    fields.push(["raw_moby_metadata", rom.raw_metadata.moby_metadata]);
   }
   if (rom.raw_metadata?.ss_metadata) {
-    formData.append("raw_ss_metadata", rom.raw_metadata.ss_metadata);
+    fields.push(["raw_ss_metadata", rom.raw_metadata.ss_metadata]);
   }
   if (rom.raw_metadata?.launchbox_metadata) {
-    formData.append(
+    fields.push([
       "raw_launchbox_metadata",
       rom.raw_metadata.launchbox_metadata,
-    );
+    ]);
   }
   if (rom.raw_metadata?.hasheous_metadata) {
-    formData.append(
-      "raw_hasheous_metadata",
-      rom.raw_metadata.hasheous_metadata,
-    );
+    fields.push(["raw_hasheous_metadata", rom.raw_metadata.hasheous_metadata]);
   }
   if (rom.raw_metadata?.flashpoint_metadata) {
-    formData.append(
+    fields.push([
       "raw_flashpoint_metadata",
       rom.raw_metadata.flashpoint_metadata,
-    );
+    ]);
   }
   if (rom.raw_metadata?.hltb_metadata) {
-    formData.append("raw_hltb_metadata", rom.raw_metadata.hltb_metadata);
+    fields.push(["raw_hltb_metadata", rom.raw_metadata.hltb_metadata]);
   }
 
   // Don't set url_cover on manual artwork upload
   if (rom.artwork) {
-    formData.append("artwork", rom.artwork);
+    fields.push(["artwork", rom.artwork]);
   } else {
-    formData.append("url_cover", rom.url_cover || "");
+    fields.push(["url_cover", rom.url_cover]);
   }
+  const formData = buildFormInput<UpdateRomInput>(fields);
 
-  return api.put(`/roms/${rom.id}`, formData, {
+  return api.put<DetailedRom>(`/roms/${rom.id}`, formData, {
     params: {
       remove_cover: removeCover,
       unmatch_metadata: unmatch,
@@ -450,8 +503,7 @@ async function uploadManuals({
 }: {
   romId: number;
   filesToUpload: File[];
-}): Promise<PromiseSettledResult<unknown>[]> {
-  const heartbeat = storeHeartbeat();
+}) {
   const uploadStore = storeUpload();
 
   const promises = filesToUpload.map((file) => {
@@ -466,7 +518,6 @@ async function uploadManuals({
             "Content-Type": "multipart/form-data",
             "X-Upload-Filename": file.name,
           },
-          timeout: heartbeat.value.FRONTEND.UPLOAD_TIMEOUT * 1000,
           params: {},
           onUploadProgress: (progressEvent: AxiosProgressEvent) => {
             uploadStore.update(file.name, progressEvent);
@@ -483,12 +534,8 @@ async function uploadManuals({
   return Promise.allSettled(promises);
 }
 
-async function removeManual({
-  romId,
-}: {
-  romId: number;
-}): Promise<{ data: DetailedRom }> {
-  return api.delete(`/roms/${romId}/manuals`);
+async function removeManual({ romId }: { romId: number }) {
+  return api.delete<DetailedRom>(`/roms/${romId}/manuals`);
 }
 
 async function updateUserRomProps({
@@ -501,12 +548,13 @@ async function updateUserRomProps({
   data: Partial<RomUserSchema>;
   updateLastPlayed?: boolean;
   removeLastPlayed?: boolean;
-}): Promise<{ data: RomUserSchema }> {
-  return api.put(`/roms/${romId}/props`, {
+}) {
+  const payload: RomUserUpdatePayload = {
     data: data,
     update_last_played: updateLastPlayed,
     remove_last_played: removeLastPlayed,
-  });
+  };
+  return api.put<RomUserSchema>(`/roms/${romId}/props`, payload);
 }
 
 async function deleteRoms({
@@ -515,11 +563,12 @@ async function deleteRoms({
 }: {
   roms: SimpleRom[];
   deleteFromFs: number[];
-}): Promise<{ data: BulkOperationResponse }> {
-  return api.post("/roms/delete", {
+}) {
+  const payload: DeleteRomsInput = {
     roms: roms.map((r) => r.id),
     delete_from_fs: deleteFromFs,
-  });
+  };
+  return api.post<BulkOperationResponse>("/roms/delete", payload);
 }
 
 // Multi-note management functions
@@ -534,8 +583,8 @@ async function createRomNote({
     is_public?: boolean;
     tags?: string[];
   };
-}): Promise<{ data: UserNoteSchema }> {
-  return api.post(`/roms/${romId}/notes`, noteData);
+}) {
+  return api.post<UserNoteSchema>(`/roms/${romId}/notes`, noteData);
 }
 
 async function updateRomNote({
@@ -551,8 +600,8 @@ async function updateRomNote({
     is_public?: boolean;
     tags?: string[];
   };
-}): Promise<{ data: UserNoteSchema }> {
-  return api.put(`/roms/${romId}/notes/${noteId}`, noteData);
+}) {
+  return api.put<UserNoteSchema>(`/roms/${romId}/notes/${noteId}`, noteData);
 }
 
 async function deleteRomNote({
@@ -561,8 +610,8 @@ async function deleteRomNote({
 }: {
   romId: number;
   noteId: number;
-}): Promise<{ data: UserNoteSchema }> {
-  return api.delete(`/roms/${romId}/notes/${noteId}`);
+}) {
+  return api.delete<UserNoteSchema>(`/roms/${romId}/notes/${noteId}`);
 }
 
 async function getRomNotes({
@@ -575,8 +624,8 @@ async function getRomNotes({
   publicOnly?: boolean;
   search?: string;
   tags?: string[];
-}): Promise<{ data: UserNoteSchema[] }> {
-  return api.get(`/roms/${romId}/notes`, {
+}) {
+  return api.get<UserNoteSchema[]>(`/roms/${romId}/notes`, {
     params: {
       public_only: publicOnly,
       search,
@@ -585,8 +634,8 @@ async function getRomNotes({
   });
 }
 
-async function getRomFilters(): Promise<{ data: RomFiltersDict }> {
-  return api.get("/roms/filters");
+async function getRomFilters() {
+  return api.get<RomFiltersDict>("/roms/filters");
 }
 
 export default {

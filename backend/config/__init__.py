@@ -113,6 +113,14 @@ ROMM_AUTH_SECRET_KEY: Final[str] = _get_env("ROMM_AUTH_SECRET_KEY", "")
 if not ROMM_AUTH_SECRET_KEY:
     raise ValueError("ROMM_AUTH_SECRET_KEY environment variable is not set!")
 
+OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS: Final[int] = safe_int(
+    _get_env("OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS"), 30 * 60
+)  # 30 minutes, in seconds
+
+OAUTH_REFRESH_TOKEN_EXPIRE_SECONDS: Final[int] = safe_int(
+    _get_env("OAUTH_REFRESH_TOKEN_EXPIRE_SECONDS"), 7 * 24 * 60 * 60
+)  # 7 days, in seconds
+
 SESSION_MAX_AGE_SECONDS: Final[int] = safe_int(
     _get_env("SESSION_MAX_AGE_SECONDS"), 14 * 24 * 60 * 60
 )  # 14 days, in seconds
@@ -126,6 +134,9 @@ DISABLE_USERPASS_LOGIN: Final[bool] = safe_str_to_bool(
     _get_env("DISABLE_USERPASS_LOGIN")
 )
 DISABLE_SETUP_WIZARD: Final[bool] = safe_str_to_bool(_get_env("DISABLE_SETUP_WIZARD"))
+INVITE_TOKEN_EXPIRY_SECONDS: Final[int] = safe_int(
+    _get_env("INVITE_TOKEN_EXPIRY_SECONDS"), 10 * 60
+)
 
 # OIDC
 OIDC_ENABLED: Final[bool] = safe_str_to_bool(_get_env("OIDC_ENABLED"))
@@ -135,6 +146,7 @@ OIDC_CLIENT_ID: Final[str] = _get_env("OIDC_CLIENT_ID", "")
 OIDC_CLIENT_SECRET: Final[str] = _get_env("OIDC_CLIENT_SECRET", "")
 OIDC_REDIRECT_URI: Final[str] = _get_env("OIDC_REDIRECT_URI", "")
 OIDC_SERVER_APPLICATION_URL: Final[str] = _get_env("OIDC_SERVER_APPLICATION_URL", "")
+OIDC_SERVER_METADATA_URL: Final[str | None] = _get_env("OIDC_SERVER_METADATA_URL")
 OIDC_CLAIM_ROLES: Final[str] = _get_env("OIDC_CLAIM_ROLES", "")
 OIDC_ROLE_VIEWER: Final[str | None] = _get_env("OIDC_ROLE_VIEWER")
 OIDC_ROLE_EDITOR: Final[str | None] = _get_env("OIDC_ROLE_EDITOR")
@@ -143,6 +155,10 @@ OIDC_TLS_CACERTFILE: Final[str | None] = _get_env("OIDC_TLS_CACERTFILE")
 OIDC_USERNAME_ATTRIBUTE: Final[str] = _get_env(
     "OIDC_USERNAME_ATTRIBUTE", "preferred_username"
 )
+OIDC_RP_INITIATED_LOGOUT: Final[bool] = safe_str_to_bool(
+    _get_env("OIDC_RP_INITIATED_LOGOUT")
+)
+OIDC_END_SESSION_ENDPOINT: Final[str] = _get_env("OIDC_END_SESSION_ENDPOINT", "")
 
 # SCANS
 SCAN_TIMEOUT: Final[int] = safe_int(_get_env("SCAN_TIMEOUT"), 60 * 60 * 4)  # 4 hours
@@ -201,7 +217,6 @@ DISABLE_EMULATOR_JS: Final[bool] = safe_str_to_bool(_get_env("DISABLE_EMULATOR_J
 DISABLE_RUFFLE_RS: Final[bool] = safe_str_to_bool(_get_env("DISABLE_RUFFLE_RS"))
 
 # FRONTEND
-UPLOAD_TIMEOUT: Final[int] = safe_int(_get_env("UPLOAD_TIMEOUT"), 600)
 KIOSK_MODE: Final[bool] = safe_str_to_bool(_get_env("KIOSK_MODE"))
 
 # LOGGING

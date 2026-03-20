@@ -27,7 +27,15 @@ const tabIndex = computed(() => (activeSettingsDrawer.value ? 0 : -1));
 const activeElement = useActiveElement();
 
 async function logout() {
-  identityApi.logout().then(async () => {
+  identityApi.logout().then(async (response) => {
+    const oidcLogoutUrl = response?.data?.oidc_logout_url;
+
+    if (oidcLogoutUrl) {
+      // Redirect the browser to the OIDC end-session endpoint for RP-Initiated Logout
+      window.location.href = oidcLogoutUrl;
+      return;
+    }
+
     // Refetch CSRF token
     await refetchCSRFToken();
 
@@ -144,6 +152,18 @@ function onClose() {
         :to="{ name: ROUTES.METADATA_SOURCES }"
       >
         {{ t("scan.metadata-sources") }}
+      </v-list-item>
+      <v-list-item
+        v-if="scopes.includes('me.write')"
+        :tabindex="tabIndex"
+        class="mt-1"
+        rounded
+        :to="{ name: ROUTES.CLIENT_API_TOKENS }"
+        append-icon="mdi-key-variant"
+        aria-label="Client API Tokens"
+        role="listitem"
+      >
+        {{ t("settings.client-api-tokens") }}
       </v-list-item>
       <v-list-item
         v-if="scopes.includes('users.write')"

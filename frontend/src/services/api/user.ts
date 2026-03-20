@@ -1,6 +1,11 @@
-import type { UserSchema, InviteLinkSchema } from "@/__generated__";
+import type {
+  Body_add_user_api_users_post as AddUserInput,
+  Body_create_user_from_invite_api_users_register_post as RegisterUserInput,
+  Body_refresh_retro_achievements_api_users__id__ra_refresh_post as RefreshRetroAchievementsInput,
+  InviteLinkSchema,
+  UserSchema,
+} from "@/__generated__";
 import api from "@/services/api";
-import type { User } from "@/stores/users";
 
 export const userApi = api;
 
@@ -14,16 +19,23 @@ async function createUser({
   password: string;
   email: string;
   role: string;
-}): Promise<{ data: UserSchema }> {
-  return api.post("/users", { username, password, email, role });
+}) {
+  const payload: AddUserInput = { username, password, email, role };
+  return api.post<UserSchema>("/users", payload);
 }
 
 async function createInviteLink({
   role,
+  expiration,
 }: {
   role: string;
-}): Promise<{ data: InviteLinkSchema }> {
-  return api.post("/users/invite-link", {}, { params: { role } });
+  expiration?: number;
+}) {
+  const params: Record<string, string | number> = { role };
+  if (expiration !== undefined) {
+    params.expiration = expiration;
+  }
+  return api.post<InviteLinkSchema>("/users/invite-link", {}, { params });
 }
 
 async function registerUser(
@@ -31,20 +43,21 @@ async function registerUser(
   email: string,
   password: string,
   token: string,
-): Promise<{ data: UserSchema }> {
-  return api.post("/users/register", { username, email, password, token });
+) {
+  const payload: RegisterUserInput = { username, email, password, token };
+  return api.post<UserSchema>("/users/register", payload);
 }
 
-async function fetchUsers(): Promise<{ data: UserSchema[] }> {
-  return api.get("/users");
+async function fetchUsers() {
+  return api.get<UserSchema[]>("/users");
 }
 
-async function fetchUser(user: User): Promise<{ data: UserSchema }> {
-  return api.get(`/users/${user.id}`);
+async function fetchUser(user: Pick<UserSchema, "id">) {
+  return api.get<UserSchema>(`/users/${user.id}`);
 }
 
-async function fetchCurrentUser(): Promise<{ data: UserSchema | null }> {
-  return api.get("/users/me");
+async function fetchCurrentUser() {
+  return api.get<UserSchema | null>("/users/me");
 }
 
 async function updateUser({
@@ -54,8 +67,8 @@ async function updateUser({
 }: Partial<UserSchema> & {
   avatar?: File;
   password?: string;
-}): Promise<{ data: UserSchema }> {
-  return api.put(
+}) {
+  return api.put<UserSchema>(
     `/users/${id}`,
     {
       avatar: avatar || null,
@@ -77,7 +90,7 @@ async function updateUser({
   );
 }
 
-async function deleteUser(user: User) {
+async function deleteUser(user: UserSchema) {
   return api.delete(`/users/${user.id}`);
 }
 
@@ -88,7 +101,8 @@ async function refreshRetroAchievements({
   id: number;
   incremental?: boolean;
 }) {
-  return api.post(`/users/${id}/ra/refresh`, { incremental });
+  const payload: RefreshRetroAchievementsInput = { incremental };
+  return api.post<void>(`/users/${id}/ra/refresh`, payload);
 }
 
 export default {

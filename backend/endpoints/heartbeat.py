@@ -1,5 +1,6 @@
 import os
 
+from anyio import Path as AnyioPath
 from fastapi import HTTPException, Request, status
 
 from config import (
@@ -15,11 +16,11 @@ from config import (
     OIDC_AUTOLOGIN,
     OIDC_ENABLED,
     OIDC_PROVIDER,
+    OIDC_RP_INITIATED_LOGOUT,
     SCHEDULED_CONVERT_IMAGES_TO_WEBP_CRON,
     SCHEDULED_RESCAN_CRON,
     SCHEDULED_UPDATE_LAUNCHBOX_METADATA_CRON,
     SCHEDULED_UPDATE_SWITCH_TITLEDB_CRON,
-    UPLOAD_TIMEOUT,
     YOUTUBE_BASE_URL,
 )
 from config.config_manager import config_manager as cm
@@ -111,7 +112,6 @@ async def heartbeat() -> HeartbeatResponse:
             "DISABLE_RUFFLE_RS": DISABLE_RUFFLE_RS,
         },
         "FRONTEND": {
-            "UPLOAD_TIMEOUT": UPLOAD_TIMEOUT,
             "DISABLE_USERPASS_LOGIN": DISABLE_USERPASS_LOGIN,
             "YOUTUBE_BASE_URL": YOUTUBE_BASE_URL,
         },
@@ -119,6 +119,7 @@ async def heartbeat() -> HeartbeatResponse:
             "ENABLED": OIDC_ENABLED,
             "AUTOLOGIN": OIDC_AUTOLOGIN,
             "PROVIDER": OIDC_PROVIDER,
+            "RP_INITIATED_LOGOUT": OIDC_RP_INITIATED_LOGOUT,
         },
         "TASKS": {
             "ENABLE_SCHEDULED_RESCAN": ENABLE_SCHEDULED_RESCAN,
@@ -227,8 +228,9 @@ async def get_setup_library_info(request: Request):
                     )
 
                 # Count files and folders in the roms directory
-                if os.path.exists(roms_path):
-                    items = os.listdir(roms_path)
+                roms_dir = AnyioPath(roms_path)
+                if await roms_dir.exists():
+                    items = [entry.name async for entry in roms_dir.iterdir()]
                     # Filter out hidden files and system files
                     rom_count = len(
                         [

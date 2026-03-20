@@ -30,7 +30,7 @@ from sqlalchemy.orm import (
     noload,
     selectinload,
 )
-from sqlalchemy.sql.elements import KeyedColumnElement
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import Select
 
 from config import ROMM_DB_DRIVER
@@ -59,13 +59,13 @@ EJS_SUPPORTED_PLATFORMS = [
     UPS.ATARI5200,
     UPS.ATARI7800,
     UPS.C_PLUS_4,
-    UPS.C64,
     UPS.CPET,
     UPS.C64,
     UPS.C128,
     UPS.COLECOVISION,
     UPS.JAGUAR,
     UPS.LYNX,
+    UPS.DOS,
     UPS.NEO_GEO_POCKET,
     UPS.NEO_GEO_POCKET_COLOR,
     UPS.NES,
@@ -77,11 +77,13 @@ EJS_SUPPORTED_PLATFORMS = [
     UPS.NINTENDO_DSI,
     UPS.GB,
     UPS.GBA,
+    UPS.GBC,
     UPS.PC_FX,
     UPS.PHILIPS_CD_I,
     UPS.PSX,
     UPS.PSP,
     UPS.SEGACD,
+    UPS.SEGA32,
     UPS.GENESIS,
     UPS.SMS,
     UPS.GAMEGEAR,
@@ -95,11 +97,17 @@ EJS_SUPPORTED_PLATFORMS = [
     UPS.WONDERSWAN_COLOR,
 ]
 
+RUFFLE_SUPPORTED_PLATFORMS = [
+    UPS.BROWSER,
+]
+
 STRIP_ARTICLES_REGEX = r"^(the|a|an)\s+"
 
 
 def _create_metadata_id_case(
-    prefix: str, id_column: KeyedColumnElement, platform_id_column: KeyedColumnElement
+    prefix: str,
+    id_column: ColumnElement,
+    platform_id_column: ColumnElement,
 ):
     return case(
         (
@@ -299,7 +307,10 @@ class DBRomsHandler(DBBaseHandler):
 
     def _filter_by_playable(self, query: Query, value: bool) -> Query:
         """Filter based on whether the rom is playable on supported platforms."""
-        predicate = Platform.slug.in_(EJS_SUPPORTED_PLATFORMS)
+        predicate = or_(
+            Platform.slug.in_(EJS_SUPPORTED_PLATFORMS),
+            Platform.slug.in_(RUFFLE_SUPPORTED_PLATFORMS),
+        )
         if not value:
             predicate = not_(predicate)
         return query.join(Platform).filter(predicate)
@@ -693,7 +704,7 @@ class DBRomsHandler(DBBaseHandler):
                             ),
                             _create_metadata_id_case(
                                 "fs",
-                                base_subquery.c.fs_name_no_tags,
+                                func.nullif(base_subquery.c.fs_name_no_tags, ""),
                                 base_subquery.c.platform_id,
                             ),
                             _create_metadata_id_case(
@@ -800,8 +811,13 @@ class DBRomsHandler(DBBaseHandler):
         if isinstance(order_attr.type, (String, Text)):
             # Remove any leading articles
             order_attr = func.trim(
-                func.lower(order_attr).regexp_replace(STRIP_ARTICLES_REGEX, "", "i")
+                func.lower(order_attr).regexp_replace(STRIP_ARTICLES_REGEX, "")
             )
+
+            # Pad numbers with leading zeros to ensure natural sorting
+            order_attr = order_attr.regexp_replace(
+                r"(\d+)", r"00000000000\1"
+            ).regexp_replace(r"0*(\d{12})", r"\1")
 
         if order_dir.lower() == "desc":
             order_attr = order_attr.desc()
@@ -861,6 +877,7 @@ class DBRomsHandler(DBBaseHandler):
             statuses_logic=kwargs.get("statuses_logic", "any"),
             player_counts_logic=kwargs.get("player_counts_logic", "any"),
             user_id=kwargs.get("user_id", None),
+            group_by_meta_id=kwargs.get("group_by_meta_id", False),
         )
         return session.scalars(roms).all()
 
@@ -874,12 +891,17 @@ class DBRomsHandler(DBBaseHandler):
         if isinstance(order_by_attr.type, (String, Text)):
             # Remove any leading articles
             order_by_attr = func.trim(
-                func.lower(order_by_attr).regexp_replace(STRIP_ARTICLES_REGEX, "", "i")
+                func.lower(order_by_attr).regexp_replace(STRIP_ARTICLES_REGEX, "")
             )
         else:
             order_by_attr = func.trim(
-                func.lower(Rom.name).regexp_replace(STRIP_ARTICLES_REGEX, "", "i")
+                func.lower(Rom.name).regexp_replace(STRIP_ARTICLES_REGEX, "")
             )
+
+        # Pad numbers with leading zeros to ensure natural sorting
+        order_by_attr = order_by_attr.regexp_replace(
+            r"(\d+)", r"00000000000\1"
+        ).regexp_replace(r"0*(\d{12})", r"\1")
 
         # Get the row number and first letter for each item
         subquery = (

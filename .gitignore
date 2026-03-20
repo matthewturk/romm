@@ -66,3 +66,6 @@ frontend/dev-dist
 switch_titledb.json
 switch_product_ids.json
 frontend/public/assets/parchment
+
+# AI tools
+.claude

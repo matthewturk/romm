@@ -5,7 +5,7 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from main import app
 
-from endpoints.auth import ACCESS_TOKEN_EXPIRE_MINUTES
+from config import OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 from handler.auth import oauth_handler
 from handler.database import db_device_handler
 from handler.redis_handler import sync_cache
@@ -27,14 +27,13 @@ def clear_cache():
 
 @pytest.fixture
 def editor_access_token(editor_user: User):
-    return oauth_handler.create_oauth_token(
+    return oauth_handler.create_access_token(
         data={
             "sub": editor_user.username,
             "iss": "romm:oauth",
             "scopes": " ".join(editor_user.oauth_scopes),
-            "type": "access",
         },
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        expires_delta=timedelta(seconds=OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS),
     )
 
 
@@ -257,6 +256,7 @@ class TestDeviceUserIsolation:
         original = db_device_handler.get_device(
             device_id=device.id, user_id=admin_user.id
         )
+        assert original is not None
         assert original.name == "Protected"
 
     def test_cannot_delete_other_users_device(
