@@ -5,7 +5,7 @@
 // <Player> component and is reused as-is; only the chrome is v2. Text
 // adventures are keyboard-driven, so the running session flags `playing` to
 // mute global hotkeys / pad-to-UI translation while the game owns input.
-import { RBtn, RCard, RSwitch } from "@v2/lib";
+import { RBtn, RCard, RIcon, RSwitch } from "@v2/lib";
 import {
   computed,
   defineAsyncComponent,
@@ -16,16 +16,20 @@ import {
 } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRoute, useRouter } from "vue-router";
+import type { SaveSchema, StateSchema } from "@/__generated__";
 import { ROUTES } from "@/plugins/router";
 import romApi from "@/services/api/rom";
 import storePlaying from "@/stores/playing";
 import storeRoms, { type DetailedRom, type SimpleRom } from "@/stores/roms";
+import AssetPreview from "@/v2/components/Player/AssetPreview.vue";
+import AssetList from "@/v2/components/shared/AssetList.vue";
 import GameCover from "@/v2/components/shared/GameCover.vue";
 import { useBackgroundArt } from "@/v2/composables/useBackgroundArt";
 import { useFullscreenPref } from "@/v2/composables/useFullscreenPref";
 import { usePageTitle } from "@/v2/composables/usePageTitle";
 import { usePlaySession } from "@/v2/composables/usePlaySession";
 import storeGalleryRoms from "@/v2/stores/galleryRoms";
+import { prepareCloudSave } from "@/views/Player/Parchment/utils";
 
 // Reuse v1's Parchment integration — do NOT rewrite this. Lazy so the bundle
 // doesn't pull in the Parchment shims until we actually mount the player.
@@ -42,6 +46,15 @@ const playSession = usePlaySession();
 
 const rom = ref<DetailedRom | null>(null);
 const gameRunning = ref(false);
+const selectedSave = ref<SaveSchema | null>(null);
+
+function selectSave(asset: SaveSchema | StateSchema) {
+  // The list below is bound with type="save", so the payload is always a save.
+  selectedSave.value = asset as SaveSchema;
+}
+function clearSelectedSave() {
+  selectedSave.value = null;
+}
 
 // Rom id from the route param (available before `rom` resolves) so the hero
 // cover paints its `view-transition-name` immediately and the shared-element
@@ -123,6 +136,11 @@ async function onPlay() {
   // Text adventures are keyboard-driven; flag the session so global hotkeys
   // and pad-to-UI translation stay muted while the game owns input.
   playingStore.setPlaying(true);
+  // Inject the picked cloud save into Parchment's localStorage provider
+  // before the VM boots so it shows up in the in-game "Restore" dialog.
+  if (selectedSave.value) {
+    await prepareCloudSave(rom.value, selectedSave.value);
+  }
   // Start timing the session now that playback is booting; flushed on
   // unmount, which is what updates last_played / now_playing / status.
   playSession.start(rom.value);
@@ -186,6 +204,29 @@ onBeforeUnmount(() => {
 
       <!-- Settings panel -->
       <RCard class="r-v2-parchment__panel" variant="flat">
+        <!-- Resume: pick a cloud save to have it available in the in-game
+             "Restore" dialog. Hidden when the ROM has no cloud saves. -->
+        <div
+          v-if="rom && rom.user_saves.length > 0"
+          class="r-v2-parchment__resume"
+        >
+          <div class="r-v2-parchment__panel-head">
+            <RIcon icon="mdi-content-save-outline" size="14" />
+            <span>{{ t("play.resume-from-save") }}</span>
+          </div>
+          <AssetPreview
+            :asset="selectedSave"
+            type="save"
+            @clear="clearSelectedSave"
+          />
+          <AssetList
+            :assets="rom.user_saves"
+            type="save"
+            :selected-id="selectedSave?.id ?? null"
+            @select="selectSave"
+          />
+        </div>
+
         <div class="r-v2-parchment__settings">
           <RSwitch v-model="fullscreenOnPlay" :label="t('play.full-screen')" />
 
@@ -310,6 +351,25 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.r-v2-parchment__resume {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+  border-bottom: 1px solid var(--r-color-border);
+}
+
+.r-v2-parchment__panel-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  font-weight: var(--r-font-weight-semibold);
+  color: var(--r-color-fg-secondary);
 }
 
 .r-v2-parchment__play {
