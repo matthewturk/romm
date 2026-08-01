@@ -4,6 +4,9 @@ from typing import Final
 
 ALGORITHM: Final = "HS256"
 DEFAULT_OAUTH_TOKEN_EXPIRY: Final = timedelta(minutes=15)
+# Name of the session cookie set by RedisSessionMiddleware (see main.py). Shared
+# so the socket log-stream handshake reads the same cookie the middleware writes.
+SESSION_COOKIE_NAME: Final = "romm_session"
 
 
 class Scope(enum.StrEnum):
@@ -23,9 +26,12 @@ class Scope(enum.StrEnum):
     FIRMWARE_WRITE = "firmware.write"
     COLLECTIONS_READ = "collections.read"
     COLLECTIONS_WRITE = "collections.write"
+    PLAYLISTS_READ = "playlists.read"
+    PLAYLISTS_WRITE = "playlists.write"
     USERS_READ = "users.read"
     USERS_WRITE = "users.write"
     TASKS_RUN = "tasks.run"
+    LOGS_READ = "logs.read"
 
 
 READ_SCOPES_MAP: Final = {
@@ -37,6 +43,7 @@ READ_SCOPES_MAP: Final = {
     Scope.FIRMWARE_READ: "View firmware",
     Scope.ROMS_USER_READ: "View user-rom properties",
     Scope.COLLECTIONS_READ: "View collections",
+    Scope.PLAYLISTS_READ: "View music playlists",
 }
 
 WRITE_SCOPES_MAP: Final = {
@@ -45,6 +52,7 @@ WRITE_SCOPES_MAP: Final = {
     Scope.DEVICES_WRITE: "Modify devices",
     Scope.ROMS_USER_WRITE: "Modify user-rom properties",
     Scope.COLLECTIONS_WRITE: "Modify collections",
+    Scope.PLAYLISTS_WRITE: "Modify music playlists",
 }
 
 EDIT_SCOPES_MAP: Final = {
@@ -57,6 +65,7 @@ FULL_SCOPES_MAP: Final = {
     Scope.USERS_READ: "View users",
     Scope.USERS_WRITE: "Modify users",
     Scope.TASKS_RUN: "Run tasks",
+    Scope.LOGS_READ: "View backend logs",
 }
 
 READ_SCOPES: Final = list(READ_SCOPES_MAP.keys())

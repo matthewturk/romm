@@ -2,16 +2,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 from fastapi import status
-from fastapi.testclient import TestClient
-from main import app
+from rq.exceptions import NoSuchJobError
 
 from tasks.tasks import Task, TaskType
-
-
-@pytest.fixture
-def client():
-    with TestClient(app) as client:
-        yield client
 
 
 @pytest.fixture
@@ -23,7 +16,9 @@ def mock_task():
     task.task_type = TaskType.CLEANUP
     task.enabled = True
     task.manual_run = True
+    task.can_run_manually = True
     task.cron_string = "0 0 * * *"
+    task.timeout = 300
     task.run = Mock()
     return task
 
@@ -37,7 +32,9 @@ def mock_disabled_task():
     task.task_type = TaskType.CLEANUP
     task.enabled = False
     task.manual_run = True
+    task.can_run_manually = False
     task.cron_string = None
+    task.timeout = 300
     task.run = Mock()
     return task
 
@@ -51,7 +48,9 @@ def mock_non_manual_task():
     task.task_type = TaskType.CLEANUP
     task.enabled = True
     task.manual_run = False
+    task.can_run_manually = False
     task.cron_string = "0 0 * * *"
+    task.timeout = 300
     task.run = Mock()
     return task
 
@@ -61,7 +60,7 @@ def create_mock_job(job_id="1", status="queued"):
     from datetime import datetime
 
     mock_job = Mock()
-    mock_job.get_id.return_value = job_id
+    mock_job.id = job_id
     mock_job.get_status.return_value = status
 
     # Create mock datetime objects with isoformat methods
@@ -94,6 +93,8 @@ class TestListTasks:
                     description="Manual task",
                     enabled=True,
                     manual_run=True,
+                    can_run_manually=True,
+                    timeout=300,
                     cron_string=None,
                 ),
             }
@@ -112,6 +113,8 @@ class TestListTasks:
                     description="Scheduled task",
                     enabled=True,
                     manual_run=False,
+                    can_run_manually=False,
+                    timeout=300,
                     cron_string="0 0 * * *",
                 ),
             }
@@ -225,6 +228,8 @@ class TestRunSingleTask:
                     description="Test Description",
                     enabled=True,
                     manual_run=True,
+                    can_run_manually=True,
+                    timeout=300,
                     run=Mock(),
                 ),
             }
@@ -276,6 +281,8 @@ class TestRunSingleTask:
                     description="Disabled Description",
                     enabled=False,
                     manual_run=True,
+                    can_run_manually=False,
+                    timeout=300,
                     run=Mock(),
                 ),
             }
@@ -307,6 +314,8 @@ class TestRunSingleTask:
                     description="Non-Manual Description",
                     enabled=True,
                     manual_run=False,
+                    can_run_manually=False,
+                    timeout=300,
                     run=Mock(),
                 ),
             }
@@ -328,6 +337,53 @@ class TestRunSingleTask:
         """Test running a task without authentication"""
         response = client.post("/api/tasks/run/test_task")
         assert response.status_code == status.HTTP_403_FORBIDDEN
+
+
+class TestGetTasksStatus:
+    """Test suite for the get_tasks_status endpoint"""
+
+    @patch("endpoints.tasks.Worker.all", return_value=[])
+    @patch("endpoints.tasks.low_prio_queue")
+    @patch("endpoints.tasks.default_queue")
+    @patch("endpoints.tasks.high_prio_queue")
+    @patch("endpoints.tasks.Job.fetch")
+    def test_get_tasks_status_skips_expired_jobs(
+        self,
+        mock_job_fetch,
+        mock_high_queue,
+        mock_default_queue,
+        mock_low_queue,
+        mock_worker_all,
+        client,
+        access_token,
+    ):
+        """Test that get_tasks_status skips jobs that have expired from Redis"""
+        mock_low_queue.get_jobs.return_value = []
+        mock_default_queue.get_jobs.return_value = []
+        mock_high_queue.get_jobs.return_value = []
+
+        mock_finished_registry = Mock()
+        mock_finished_registry.get_job_ids.return_value = ["expired-job-id"]
+        mock_failed_registry = Mock()
+        mock_failed_registry.get_job_ids.return_value = []
+
+        mock_job_fetch.side_effect = NoSuchJobError(
+            "No such job: rq:job:expired-job-id"
+        )
+
+        with patch(
+            "endpoints.tasks.FinishedJobRegistry", return_value=mock_finished_registry
+        ):
+            with patch(
+                "endpoints.tasks.FailedJobRegistry", return_value=mock_failed_registry
+            ):
+                response = client.get(
+                    "/api/tasks/status",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
 
 
 class TestGetTaskById:
@@ -355,7 +411,7 @@ class TestGetTaskById:
         }
         mock_job.func_name = "test_task"
         mock_job.get_status.return_value = "finished"
-        mock_job.get_id.return_value = "test-job-id-123"
+        mock_job.id = "test-job-id-123"
         mock_job.result = {"status": "completed"}
 
         mock_job_fetch.return_value = mock_job
@@ -418,7 +474,7 @@ class TestGetTaskById:
         }
         mock_job.func_name = "test_task"
         mock_job.get_status.return_value = "failed"
-        mock_job.get_id.return_value = "failed-job-id"
+        mock_job.id = "failed-job-id"
         mock_job.result = {"error": "Task failed"}
 
         mock_job_fetch.return_value = mock_job
@@ -470,6 +526,8 @@ class TestTaskInfoBuilding:
                         description="Test Description",
                         enabled=True,
                         manual_run=True,
+                        can_run_manually=True,
+                        timeout=300,
                         cron_string="0 0 * * *",
                     ),
                 }
@@ -515,6 +573,8 @@ class TestIntegration:
                         description="Workflow Description",
                         enabled=True,
                         manual_run=True,
+                        can_run_manually=True,
+                        timeout=300,
                         run=Mock(),
                     ),
                 }

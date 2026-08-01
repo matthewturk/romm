@@ -6,27 +6,13 @@ from unittest import mock
 
 import pytest
 from fastapi import status
-from fastapi.testclient import TestClient
-from main import app
 
 from config import OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 from handler.auth import oauth_handler
 from handler.auth.middleware.redis_session_middleware import RedisSessionMiddleware
 from handler.database.users_handler import DBUsersHandler
-from handler.redis_handler import async_cache, sync_cache
+from handler.redis_handler import async_cache
 from models.user import Role, User
-
-
-@pytest.fixture
-def client():
-    with TestClient(app) as client:
-        yield client
-
-
-@pytest.fixture(autouse=True)
-def clear_cache():
-    yield
-    sync_cache.flushall()
 
 
 def test_login_logout(client, admin_user: User):
@@ -69,7 +55,39 @@ def test_get_user(client, access_token: str, editor_user: User):
     assert user["username"] == "test_editor"
 
 
-@pytest.mark.parametrize("new_user_role", [Role.VIEWER, Role.EDITOR, Role.ADMIN])
+@mock.patch("endpoints.user.fs_asset_handler.validate_path")
+def test_get_user_avatar(
+    mock_validate_path, client, viewer_access_token: str, admin_user: User, tmp_path
+):
+    from handler.database import db_user_handler
+
+    db_user_handler.update_user(
+        admin_user.id,
+        {"avatar_path": f"users/{admin_user.fs_safe_folder_name}/profile/avatar.png"},
+    )
+    avatar = tmp_path / "avatar.png"
+    avatar.write_bytes(b"PNGDATA")
+    mock_validate_path.return_value = avatar
+
+    # Any authenticated user can read any user's avatar.
+    response = client.get(
+        f"/api/users/{admin_user.id}/avatar",
+        headers={"Authorization": f"Bearer {viewer_access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.content == b"PNGDATA"
+    assert response.headers["content-type"].startswith("image/")
+
+
+def test_get_user_avatar_none_set(client, access_token: str, admin_user: User):
+    response = client.get(
+        f"/api/users/{admin_user.id}/avatar",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+@pytest.mark.parametrize("new_user_role", [Role.USER, Role.ADMIN])
 def test_add_user_from_admin_user(client, access_token: str, new_user_role: Role):
     response = client.post(
         "/api/users",
@@ -127,7 +145,7 @@ def test_add_user_from_unauthorized_user(
                 "username": "new_user",
                 "password": "new_user_password",
                 "email": "new_user@example.com",
-                "role": Role.VIEWER.value,
+                "role": Role.USER.value,
             },
             headers={"Authorization": f"Bearer {access_token}"},
         )
@@ -141,7 +159,7 @@ def test_add_user_with_existing_username(client, access_token: str, admin_user: 
             "username": admin_user.username,
             "password": "new_user_password",
             "email": "new_user@example.com",
-            "role": Role.VIEWER.value,
+            "role": Role.USER.value,
         },
         headers={"Authorization": f"Bearer {access_token}"},
     )
@@ -152,17 +170,56 @@ def test_add_user_with_existing_username(client, access_token: str, admin_user: 
 
 
 def test_update_user(client, access_token: str, editor_user: User):
-    assert editor_user.role == Role.EDITOR
+    assert editor_user.role == Role.USER
 
     response = client.put(
         f"/api/users/{editor_user.id}",
-        data={"username": "editor_user_new_username", "role": "viewer"},
+        data={"username": "editor_user_new_username", "role": "user"},
         headers={"Authorization": f"Bearer {access_token}"},
     )
     assert response.status_code == status.HTTP_200_OK
 
     user = response.json()
-    assert user["role"] == "viewer"
+    assert user["role"] == "user"
+
+
+def test_update_user_rejects_non_image_avatar(
+    client, access_token: str, editor_user: User
+):
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        files={"avatar": ("avatar.png", b"<script>alert(1)</script>", "image/png")},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert "PNG, JPEG, WebP, or GIF" in response.json()["detail"]
+
+
+def test_update_user_accepts_png_avatar(
+    client, access_token: str, editor_user: User, tmp_path, monkeypatch
+):
+    # Redirect ASSETS_BASE_PATH to a per-test tmp dir so the written avatar
+    # doesn't leak into the repo's romm_test/ tree.
+    from handler.filesystem import fs_asset_handler
+
+    monkeypatch.setattr(fs_asset_handler, "base_path", str(tmp_path))
+
+    # Minimal valid PNG (1x1 transparent pixel)
+    png_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+        b"\x00\x00\x00\rIDATx\x9cc\xfc\xff\xff?\x00\x05\xfe\x02\xfe\xa75\x81\x84"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    response = client.put(
+        f"/api/users/{editor_user.id}",
+        files={"avatar": ("payload.html", png_bytes, "image/png")},
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert response.status_code == status.HTTP_200_OK
+    # Server picks the extension from the detected MIME, not the user-supplied filename.
+    assert response.json()["avatar_path"].endswith("avatar.png")
 
 
 def test_delete_user(client, access_token: str, editor_user: User):
@@ -186,8 +243,11 @@ async def test_password_change_invalidates_sessions(client, admin_user: User):
     old_session_cookie = response.cookies.get("romm_session")
     assert old_session_cookie is not None
 
+    def _cookie_header(cookie_value: str) -> dict[str, str]:
+        return {"Cookie": f"romm_session={cookie_value}"}
+
     # Verify session works
-    response = client.get("/api/users/me", cookies={"romm_session": old_session_cookie})
+    response = client.get("/api/users/me", headers=_cookie_header(old_session_cookie))
     assert response.status_code == HTTPStatus.OK
 
     # Update the user's password
@@ -199,7 +259,7 @@ async def test_password_change_invalidates_sessions(client, admin_user: User):
     assert response.status_code == HTTPStatus.OK
 
     # Attempt to access a protected resource using the old session cookie
-    response = client.get("/api/users/me", cookies={"romm_session": old_session_cookie})
+    response = client.get("/api/users/me", headers=_cookie_header(old_session_cookie))
     assert response.status_code in [HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN]
 
     # Login with the new credentials
@@ -215,7 +275,7 @@ async def test_password_change_invalidates_sessions(client, admin_user: User):
     assert new_session_cookie != old_session_cookie
 
     # Attempt to access a protected resource using the new session cookie
-    response = client.get("/api/users/me", cookies={"romm_session": new_session_cookie})
+    response = client.get("/api/users/me", headers=_cookie_header(new_session_cookie))
     assert response.status_code == HTTPStatus.OK
 
     await RedisSessionMiddleware.clear_user_sessions(admin_user.username)
@@ -234,16 +294,19 @@ async def test_logout_invalidates_session(client, admin_user: User):
     session_cookie = response.cookies.get("romm_session")
     assert session_cookie is not None
 
+    def _cookie_header(cookie_value: str) -> dict[str, str]:
+        return {"Cookie": f"romm_session={cookie_value}"}
+
     # Verify session works
-    response = client.get("/api/users/me", cookies={"romm_session": session_cookie})
+    response = client.get("/api/users/me", headers=_cookie_header(session_cookie))
     assert response.status_code == HTTPStatus.OK
 
     # Log out the user
-    response = client.post("/api/logout", cookies={"romm_session": session_cookie})
+    response = client.post("/api/logout", headers=_cookie_header(session_cookie))
     assert response.status_code == HTTPStatus.OK
 
     # Attempt to access a protected resource using the old session cookie
-    response = client.get("/api/users/me", cookies={"romm_session": session_cookie})
+    response = client.get("/api/users/me", headers=_cookie_header(session_cookie))
     assert response.status_code in [HTTPStatus.UNAUTHORIZED, HTTPStatus.FORBIDDEN]
 
     await RedisSessionMiddleware.clear_user_sessions(admin_user.username)
@@ -291,7 +354,7 @@ async def test_logout_with_oidc_rp_initiated_logout(client, admin_user: User):
     ):
         response = client.post(
             "/api/logout",
-            cookies={"romm_session": session_cookie},
+            headers={"Cookie": f"romm_session={session_cookie}"},
         )
         assert response.status_code == HTTPStatus.OK
         data = response.json()

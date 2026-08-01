@@ -3,6 +3,7 @@ from typing import Any, TypedDict
 
 from fastapi import Body, HTTPException, Request
 from rq import Worker
+from rq.exceptions import NoSuchJobError
 from rq.job import Job, JobStatus
 from rq.registry import FailedJobRegistry, FinishedJobRegistry
 
@@ -10,7 +11,6 @@ from config import (
     ENABLE_RESCAN_ON_FILESYSTEM_CHANGE,
     RESCAN_ON_FILESYSTEM_CHANGE_DELAY,
     TASK_RESULT_TTL,
-    TASK_TIMEOUT,
 )
 from decorators.auth import protected_route
 from endpoints.responses import (
@@ -18,6 +18,7 @@ from endpoints.responses import (
     ConversionTaskStatusResponse,
     GenericTaskStatusResponse,
     ScanTaskStatusResponse,
+    SyncTaskStatusResponse,
     TaskExecutionResponse,
     TaskStatusResponse,
     UpdateTaskStatusResponse,
@@ -33,7 +34,12 @@ from handler.redis_handler import (
     redis_client,
 )
 from tasks.manual.cleanup_missing_roms import cleanup_missing_roms_task
-from tasks.manual.cleanup_orphaned_resources import cleanup_orphaned_resources_task
+from tasks.manual.recompute_save_content_hashes import (
+    recompute_save_content_hashes_task,
+)
+from tasks.manual.sync_folder_scan import sync_folder_scan_task
+from tasks.scheduled.cleanup_orphaned_resources import cleanup_orphaned_resources_task
+from tasks.scheduled.cleanup_zip_cache import cleanup_zip_cache_task
 from tasks.scheduled.convert_images_to_webp import convert_images_to_webp_task
 from tasks.scheduled.scan_library import scan_library_task
 from tasks.scheduled.update_launchbox_metadata import update_launchbox_metadata_task
@@ -89,21 +95,42 @@ scheduled_tasks: list[ScheduledTask] = [
             "task": convert_images_to_webp_task,
         }
     ),
-]
-
-manual_tasks: list[ManualTask] = [
-    ManualTask(
+    ScheduledTask(
+        {
+            "name": "cleanup_zip_cache",
+            "type": TaskType.CLEANUP,
+            "task": cleanup_zip_cache_task,
+        }
+    ),
+    ScheduledTask(
         {
             "name": "cleanup_orphaned_resources",
             "type": TaskType.CLEANUP,
             "task": cleanup_orphaned_resources_task,
         }
     ),
+]
+
+manual_tasks: list[ManualTask] = [
     ManualTask(
         {
             "name": "cleanup_missing_roms",
             "type": TaskType.CLEANUP,
             "task": cleanup_missing_roms_task,
+        }
+    ),
+    ManualTask(
+        {
+            "name": "sync_folder_scan",
+            "type": TaskType.SYNC,
+            "task": sync_folder_scan_task,
+        }
+    ),
+    ManualTask(
+        {
+            "name": "recompute_save_content_hashes",
+            "type": TaskType.CLEANUP,
+            "task": recompute_save_content_hashes_task,
         }
     ),
 ]
@@ -117,7 +144,7 @@ def _build_task_info(name: str, task: Task) -> TaskInfo:
         title=task.title,
         description=task.description,
         enabled=task.enabled,
-        manual_run=task.manual_run,
+        manual_run=task.can_run_manually,
         cron_string=task.cron_string or "",
     )
 
@@ -137,7 +164,7 @@ def _build_task_status_response(
 
     common_data = {
         "task_name": task_name,
-        "task_id": job.get_id(),
+        "task_id": job.id,
         "status": job.get_status(),
         "created_at": created_at,
         "enqueued_at": enqueued_at,
@@ -175,6 +202,12 @@ def _build_task_status_response(
             return CleanupTaskStatusResponse(
                 task_type=TaskType.CLEANUP,
                 meta={"cleanup_stats": job_meta.get("cleanup_stats")},
+                **common_data,  # trunk-ignore(mypy/typeddict-item)
+            )
+        case TaskType.SYNC:
+            return SyncTaskStatusResponse(
+                task_type=TaskType.SYNC,
+                meta={},
                 **common_data,  # trunk-ignore(mypy/typeddict-item)
             )
         case TaskType.WATCHER:
@@ -273,7 +306,11 @@ async def get_tasks_status(request: Request) -> list[TaskStatusResponse]:
     # Process finished jobs
     for registry in finished_registries:
         for job_id in registry.get_job_ids():
-            job = Job.fetch(job_id, connection=redis_client)
+            try:
+                job = Job.fetch(job_id, connection=redis_client)
+            except NoSuchJobError:
+                registry.remove(job_id)
+                continue
             all_tasks.append(
                 _build_task_status_response(
                     job,
@@ -283,7 +320,11 @@ async def get_tasks_status(request: Request) -> list[TaskStatusResponse]:
     # Process failed jobs
     for registry in failed_registries:
         for job_id in registry.get_job_ids():
-            job = Job.fetch(job_id, connection=redis_client)
+            try:
+                job = Job.fetch(job_id, connection=redis_client)
+            except NoSuchJobError:
+                registry.remove(job_id)
+                continue
             all_tasks.append(_build_task_status_response(job))
 
     all_tasks.sort(
@@ -343,7 +384,7 @@ async def run_single_task(
         )
 
     task_instance = all_tasks[task_name]
-    if not task_instance.enabled or not task_instance.manual_run:
+    if not task_instance.can_run_manually:
         raise HTTPException(
             status_code=400,
             detail=f"Task '{task_name}' cannot be run",
@@ -352,7 +393,7 @@ async def run_single_task(
     job = low_prio_queue.enqueue(
         task_instance.run,
         kwargs=task_kwargs or {},
-        job_timeout=TASK_TIMEOUT,
+        job_timeout=task_instance.timeout,
         result_ttl=TASK_RESULT_TTL,
         meta={
             "task_name": task_instance.title,
@@ -362,7 +403,7 @@ async def run_single_task(
 
     return {
         "task_name": task_instance.title,
-        "task_id": job.get_id(),
+        "task_id": job.id,
         "status": job.get_status() or JobStatus.QUEUED,
         "created_at": (
             job.created_at.isoformat()

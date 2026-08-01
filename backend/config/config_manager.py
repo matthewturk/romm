@@ -1,7 +1,10 @@
 import enum
+import functools
+import glob
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Final, NotRequired, TypedDict
 
 import pydash
@@ -45,9 +48,11 @@ DEFAULT_EXCLUDED_FILES: Final = [
     ".stfolder",
     "@SynoResource",
     "gamelist.xml",
+    "metadata.pegasus.txt",
 ]
 DEFAULT_EXCLUDED_DIRS: Final = [
     "@eaDir",
+    "assets",
     "__MACOSX",
     "$RECYCLE.BIN",
     ".Trash-*",
@@ -68,8 +73,10 @@ class MetadataMediaType(enum.StrEnum):
     BEZEL = "bezel"
     BOX2D = "box2d"
     BOX2D_BACK = "box2d_back"
+    BOX2D_SIDE = "box2d_side"
     BOX3D = "box3d"
     MIXIMAGE = "miximage"
+    MIXIMAGE_V2 = "miximage_v2"
     PHYSICAL = "physical"
     SCREENSHOT = "screenshot"
     TITLE_SCREEN = "title_screen"
@@ -79,6 +86,63 @@ class MetadataMediaType(enum.StrEnum):
     VIDEO = "video"
     VIDEO_NORMALIZED = "video_normalized"
     MANUAL = "manual"
+
+
+# User-facing scan.priority.* keys that each override SCAN_ARTWORK_PRIORITY for a
+# single artwork field. Maps the config key to the Rom field it controls.
+ARTWORK_PRIORITY_KEYS = {
+    "cover": "url_cover",
+    "screenshot": "url_screenshots",
+    "manual": "url_manual",
+}
+
+# Valid MetadataMediaType values for the gamelist <thumbnail> and <image>
+# tags. Kept as module constants so the config loader and the scan-settings
+# endpoint validate against the same sets.
+VALID_GAMELIST_THUMBNAIL_TYPES = frozenset(
+    {
+        MetadataMediaType.BOX2D,
+        MetadataMediaType.BOX3D,
+        MetadataMediaType.MIXIMAGE,
+        MetadataMediaType.MIXIMAGE_V2,
+        MetadataMediaType.PHYSICAL,
+    }
+)
+VALID_GAMELIST_IMAGE_TYPES = frozenset(
+    {
+        MetadataMediaType.TITLE_SCREEN,
+        MetadataMediaType.MIXIMAGE,
+        MetadataMediaType.MIXIMAGE_V2,
+        MetadataMediaType.BOX2D,
+        MetadataMediaType.SCREENSHOT,
+    }
+)
+
+# Valid provider slugs for scan.priority.* lists. Mirrors
+# handler.scan_handler.MetadataSource, which can't be imported here without a
+# circular import; test_config_loader guards against drift.
+VALID_SCAN_PRIORITY_SOURCES = frozenset(
+    {
+        "igdb",
+        "moby",
+        "ss",
+        "ra",
+        "launchbox",
+        "hasheous",
+        "tgdb",
+        "sgdb",
+        "flashpoint",
+        "hltb",
+        "gamelist",
+        "libretro",
+        "playmatch",
+    }
+)
+
+# Valid values for scan.priority.region_mode. "prefer_rom_tags" keeps the
+# rom's filename region tags authoritative for media selection;
+# "prefer_config" makes scan.priority.region win over the rom's own tags.
+VALID_SCAN_REGION_MODES = frozenset({"prefer_rom_tags", "prefer_config"})
 
 
 class EjsControls(TypedDict):
@@ -97,9 +161,17 @@ class NetplayICEServer(TypedDict):
     credential: NotRequired[str]
 
 
+class StreamingContainer(TypedDict):
+    platform: str
+    host: str
+    broker_host: str
+    label: str
+
+
 class Config:
     CONFIG_FILE_MOUNTED: bool
     CONFIG_FILE_WRITABLE: bool
+    CONFIG_FILE_PARSE_ERROR: str | None
     EXCLUDED_PLATFORMS: list[str]
     EXCLUDED_SINGLE_EXT: list[str]
     EXCLUDED_SINGLE_FILES: list[str]
@@ -107,12 +179,12 @@ class Config:
     EXCLUDED_MULTI_PARTS_EXT: list[str]
     EXCLUDED_MULTI_PARTS_FILES: list[str]
     GAMELIST_AUTO_EXPORT_ON_SCAN: bool
+    PEGASUS_AUTO_EXPORT_ON_SCAN: bool
     PLATFORMS_BINDING: dict[str, str]
     PLATFORMS_VERSIONS: dict[str, str]
     ROMS_FOLDER_NAME: str
     FIRMWARE_FOLDER_NAME: str
     SKIP_HASH_CALCULATION: bool
-    HIGH_PRIO_STRUCTURE_PATH: str
     EJS_DEBUG: bool
     EJS_CACHE_LIMIT: int | None
     EJS_DISABLE_AUTO_UNLOAD: bool
@@ -123,13 +195,40 @@ class Config:
     EJS_CONTROLS: dict[str, EjsControls]  # core_name -> EjsControls
     SCAN_METADATA_PRIORITY: list[str]
     SCAN_ARTWORK_PRIORITY: list[str]
+    SCAN_ARTWORK_PRIORITY_OVERRIDES: dict[str, list[str]]
     SCAN_REGION_PRIORITY: list[str]
+    SCAN_REGION_MODE: str
     SCAN_LANGUAGE_PRIORITY: list[str]
     SCAN_MEDIA: list[str]
+    GAMELIST_MEDIA_THUMBNAIL: MetadataMediaType
+    GAMELIST_MEDIA_IMAGE: MetadataMediaType
+    STREAMING_ENABLED: bool
+    STREAMING_CONTAINERS: list[StreamingContainer]
 
     def __init__(self, **entries):
         self.__dict__.update(entries)
-        self.HIGH_PRIO_STRUCTURE_PATH = f"{LIBRARY_BASE_PATH}/{self.ROMS_FOLDER_NAME}"
+
+    @functools.cached_property
+    def has_structure_path_a(self) -> bool:
+        # Structure A ({roms_folder}/{platform}) takes priority: if the top-level roms
+        # folder exists, claim Structure A even if some platform dirs happen to
+        # contain a {roms_folder} sub-folder.
+        roms_path = os.path.join(LIBRARY_BASE_PATH, self.ROMS_FOLDER_NAME)
+        return os.path.isdir(roms_path)
+
+    @functools.cached_property
+    def has_structure_path_b(self) -> bool:
+        if self.has_structure_path_a:
+            return False
+
+        pattern = os.path.join(
+            LIBRARY_BASE_PATH, "*", glob.escape(self.ROMS_FOLDER_NAME)
+        )
+        for match in glob.iglob(pattern):
+            if os.path.isdir(match):
+                return True
+
+        return False
 
 
 class ConfigManager:
@@ -144,6 +243,7 @@ class ConfigManager:
     _raw_config: dict = {}
     _config_file_mounted: bool = False
     _config_file_writable: bool = False
+    _config_file_parse_error: str | None = None
 
     def __new__(cls, *args, **kwargs):
         if cls._self is None:
@@ -159,14 +259,12 @@ class ConfigManager:
             # Check if the config file is mounted
             with open(self.config_file, "r") as cf:
                 self._config_file_mounted = True
-                self._raw_config = yaml.load(cf, Loader=SafeLoader) or {}
+                self._raw_config = self._safe_load_yaml(cf)
 
             # Also check if the config file is writable
             self._config_file_writable = os.access(self.config_file, os.W_OK)
         except FileNotFoundError:
-            log.critical(
-                "Config file not found! Any changes made to the configuration will not persist after the application restarts."
-            )
+            self._create_missing_config_file()
         except PermissionError:
             log.warning(
                 "Config file not writable! Any changes made to the configuration will not persist after the application restarts."
@@ -175,6 +273,47 @@ class ConfigManager:
             # Set the config to default values
             self._parse_config()
             self._validate_config()
+
+    def _safe_load_yaml(self, cf) -> dict:
+        """Load YAML, falling back to an empty config on syntax errors so the
+        app can still boot with defaults rather than crashing."""
+        try:
+            config = yaml.load(cf, Loader=SafeLoader) or {}
+            self._config_file_parse_error = None
+            return config
+        except yaml.YAMLError as exc:
+            log.critical(
+                f"Failed to parse {hl(self.config_file, BLUE)}: {exc}. "
+                "Falling back to default configuration, fix the YAML "
+                "syntax to apply your settings."
+            )
+            # Keep the error around so it can be surfaced in the UI, since the
+            # whole config (not just the broken part) is discarded here.
+            self._config_file_parse_error = str(exc)
+            return {}
+
+    def _create_missing_config_file(self) -> None:
+        log.warning(
+            f"Config file not found, creating an empty config at {hl(self.config_file, BLUE)}"
+        )
+
+        try:
+            config_file = Path(self.config_file)
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            config_file.touch(exist_ok=True)
+
+            # Reset any previously loaded singleton state so parsing reflects
+            # the newly created empty config file.
+            self._raw_config = {}
+            self._config_file_parse_error = None
+            self._config_file_mounted = True
+            self._config_file_writable = os.access(self.config_file, os.W_OK)
+        except PermissionError:
+            self._config_file_mounted = False
+            self._config_file_writable = False
+            log.critical(
+                "Config file not found and could not be created! Any changes made to the configuration will not persist after the application restarts."
+            )
 
     @staticmethod
     def get_db_engine() -> URL:
@@ -224,39 +363,68 @@ class ConfigManager:
         self.config = Config(
             CONFIG_FILE_MOUNTED=self._config_file_mounted,
             CONFIG_FILE_WRITABLE=self._config_file_writable,
-            EXCLUDED_PLATFORMS=pydash.get(
-                self._raw_config, "exclude.platforms", DEFAULT_EXCLUDED_DIRS
+            CONFIG_FILE_PARSE_ERROR=self._config_file_parse_error,
+            EXCLUDED_PLATFORMS=sorted(
+                {
+                    *DEFAULT_EXCLUDED_DIRS,
+                    *pydash.get(self._raw_config, "exclude.platforms", []),
+                }
             ),
-            EXCLUDED_SINGLE_EXT=[
-                e.lower()
-                for e in pydash.get(
-                    self._raw_config,
-                    "exclude.roms.single_file.extensions",
-                    DEFAULT_EXCLUDED_EXTENSIONS,
-                )
-            ],
-            EXCLUDED_SINGLE_FILES=pydash.get(
-                self._raw_config,
-                "exclude.roms.single_file.names",
-                DEFAULT_EXCLUDED_FILES,
+            EXCLUDED_SINGLE_EXT=sorted(
+                {
+                    *(e.lower() for e in DEFAULT_EXCLUDED_EXTENSIONS),
+                    *(
+                        e.lower()
+                        for e in pydash.get(
+                            self._raw_config,
+                            "exclude.roms.single_file.extensions",
+                            [],
+                        )
+                    ),
+                }
             ),
-            EXCLUDED_MULTI_FILES=pydash.get(
-                self._raw_config,
-                "exclude.roms.multi_file.names",
-                DEFAULT_EXCLUDED_DIRS,
+            EXCLUDED_SINGLE_FILES=sorted(
+                {
+                    *DEFAULT_EXCLUDED_FILES,
+                    *pydash.get(
+                        self._raw_config,
+                        "exclude.roms.single_file.names",
+                        [],
+                    ),
+                }
             ),
-            EXCLUDED_MULTI_PARTS_EXT=[
-                e.lower()
-                for e in pydash.get(
-                    self._raw_config,
-                    "exclude.roms.multi_file.parts.extensions",
-                    DEFAULT_EXCLUDED_EXTENSIONS,
-                )
-            ],
-            EXCLUDED_MULTI_PARTS_FILES=pydash.get(
-                self._raw_config,
-                "exclude.roms.multi_file.parts.names",
-                DEFAULT_EXCLUDED_FILES,
+            EXCLUDED_MULTI_FILES=sorted(
+                {
+                    *DEFAULT_EXCLUDED_DIRS,
+                    *pydash.get(
+                        self._raw_config,
+                        "exclude.roms.multi_file.names",
+                        [],
+                    ),
+                }
+            ),
+            EXCLUDED_MULTI_PARTS_EXT=sorted(
+                {
+                    *(e.lower() for e in DEFAULT_EXCLUDED_EXTENSIONS),
+                    *(
+                        e.lower()
+                        for e in pydash.get(
+                            self._raw_config,
+                            "exclude.roms.multi_file.parts.extensions",
+                            [],
+                        )
+                    ),
+                }
+            ),
+            EXCLUDED_MULTI_PARTS_FILES=sorted(
+                {
+                    *DEFAULT_EXCLUDED_FILES,
+                    *pydash.get(
+                        self._raw_config,
+                        "exclude.roms.multi_file.parts.names",
+                        [],
+                    ),
+                }
             ),
             PLATFORMS_BINDING=pydash.get(self._raw_config, "system.platforms", {}),
             PLATFORMS_VERSIONS=pydash.get(self._raw_config, "system.versions", {}),
@@ -265,9 +433,6 @@ class ConfigManager:
             ),
             FIRMWARE_FOLDER_NAME=pydash.get(
                 self._raw_config, "filesystem.firmware_folder", "bios"
-            ),
-            GAMELIST_AUTO_EXPORT_ON_SCAN=pydash.get(
-                self._raw_config, "scan.export_gamelist", False
             ),
             SKIP_HASH_CALCULATION=pydash.get(
                 self._raw_config, "filesystem.skip_hash_calculation", False
@@ -310,9 +475,11 @@ class ConfigManager:
                 self._raw_config,
                 "scan.priority.artwork",
                 [
+                    "sgdb",
                     "igdb",
                     "moby",
                     "ss",
+                    "libretro",
                     "ra",
                     "launchbox",
                     "gamelist",
@@ -322,15 +489,26 @@ class ConfigManager:
                     "hltb",
                 ],
             ),
+            SCAN_ARTWORK_PRIORITY_OVERRIDES={
+                field: override
+                for key, field in ARTWORK_PRIORITY_KEYS.items()
+                if (override := pydash.get(self._raw_config, f"scan.priority.{key}"))
+                is not None
+            },
             SCAN_REGION_PRIORITY=pydash.get(
                 self._raw_config,
                 "scan.priority.region",
                 ["us", "wor", "ss", "eu", "jp"],
             ),
+            SCAN_REGION_MODE=pydash.get(
+                self._raw_config,
+                "scan.priority.region_mode",
+                "prefer_rom_tags",
+            ),
             SCAN_LANGUAGE_PRIORITY=pydash.get(
                 self._raw_config,
                 "scan.priority.language",
-                ["en", "fr"],
+                ["en"],
             ),
             SCAN_MEDIA=pydash.get(
                 self._raw_config,
@@ -340,6 +518,26 @@ class ConfigManager:
                     "screenshot",
                     "manual",
                 ],
+            ),
+            GAMELIST_AUTO_EXPORT_ON_SCAN=pydash.get(
+                self._raw_config, "scan.gamelist.export", False
+            ),
+            GAMELIST_MEDIA_THUMBNAIL=pydash.get(
+                self._raw_config,
+                "scan.gamelist.media.thumbnail",
+                MetadataMediaType.BOX2D,
+            ),
+            GAMELIST_MEDIA_IMAGE=pydash.get(
+                self._raw_config,
+                "scan.gamelist.media.image",
+                MetadataMediaType.SCREENSHOT,
+            ),
+            PEGASUS_AUTO_EXPORT_ON_SCAN=pydash.get(
+                self._raw_config, "scan.pegasus.export", False
+            ),
+            STREAMING_ENABLED=pydash.get(self._raw_config, "streaming.enabled", False),
+            STREAMING_CONTAINERS=pydash.get(
+                self._raw_config, "streaming.containers", []
             ),
         )
 
@@ -410,8 +608,13 @@ class ConfigManager:
                 "Invalid config.yml: exclude.roms.multi_file.parts.names must be a list"
             )
             sys.exit(3)
+
         if not isinstance(self.config.GAMELIST_AUTO_EXPORT_ON_SCAN, bool):
-            log.critical("Invalid config.yml: scan.export_gamelist must be a boolean")
+            log.critical("Invalid config.yml: scan.gamelist.export must be a boolean")
+            sys.exit(3)
+
+        if not isinstance(self.config.PEGASUS_AUTO_EXPORT_ON_SCAN, bool):
+            log.critical("Invalid config.yml: scan.pegasus.export must be a boolean")
             sys.exit(3)
 
         if not isinstance(self.config.PLATFORMS_BINDING, dict):
@@ -538,9 +741,37 @@ class ConfigManager:
             log.critical("Invalid config.yml: scan.priority.artwork must be a list")
             sys.exit(3)
 
+        for key, field in ARTWORK_PRIORITY_KEYS.items():
+            override = self.config.SCAN_ARTWORK_PRIORITY_OVERRIDES.get(field)
+            if override is None:
+                continue
+
+            if not isinstance(override, list):
+                log.critical(f"Invalid config.yml: scan.priority.{key} must be a list")
+                sys.exit(3)
+
+            # Unknown sources are dropped downstream
+            unknown = [s for s in override if s not in VALID_SCAN_PRIORITY_SOURCES]
+            if unknown:
+                log.warning(
+                    f"Ignoring unknown values in scan.priority.{key}: {unknown}. "
+                    "Check for typos, or update if these are newer sources."
+                )
+
         if not isinstance(self.config.SCAN_REGION_PRIORITY, list):
             log.critical("Invalid config.yml: scan.priority.region must be a list")
             sys.exit(3)
+
+        if (
+            not isinstance(self.config.SCAN_REGION_MODE, str)
+            or self.config.SCAN_REGION_MODE not in VALID_SCAN_REGION_MODES
+        ):
+            log.warning(
+                f"Unknown scan.priority.region_mode value "
+                f"{self.config.SCAN_REGION_MODE!r}; falling back to "
+                f"'prefer_rom_tags'. Valid options: {sorted(VALID_SCAN_REGION_MODES)}."
+            )
+            self.config.SCAN_REGION_MODE = "prefer_rom_tags"
 
         if not isinstance(self.config.SCAN_LANGUAGE_PRIORITY, list):
             log.critical("Invalid config.yml: scan.priority.language must be a list")
@@ -550,19 +781,66 @@ class ConfigManager:
             log.critical("Invalid config.yml: scan.media must be a list")
             sys.exit(3)
 
-        for media in self.config.SCAN_MEDIA:
-            if media not in MetadataMediaType:
-                log.critical(
-                    f"Invalid config.yml: scan.media.{media} is not a valid media type"
-                )
-                sys.exit(3)
+        # Drop unknown media types rather than exiting, since a newer release
+        # may ship sample configs referencing media types this version doesn't know.
+        unknown_media = [
+            m for m in self.config.SCAN_MEDIA if m not in MetadataMediaType
+        ]
+        if unknown_media:
+            log.warning(
+                f"Ignoring unknown values in scan.media: {unknown_media}. "
+                "These may be from a newer RomM version; update to use them."
+            )
+            self.config.SCAN_MEDIA = [
+                m for m in self.config.SCAN_MEDIA if m in MetadataMediaType
+            ]
+
+        valid_thumbnail_options = VALID_GAMELIST_THUMBNAIL_TYPES
+        if not isinstance(self.config.GAMELIST_MEDIA_THUMBNAIL, str):
+            log.critical(
+                "Invalid config.yml: scan.gamelist.media.thumbnail must be a string"
+            )
+            sys.exit(3)
+        if self.config.GAMELIST_MEDIA_THUMBNAIL not in valid_thumbnail_options:
+            log.warning(
+                f"Unknown scan.gamelist.media.thumbnail value "
+                f"{self.config.GAMELIST_MEDIA_THUMBNAIL!r}; falling back to "
+                f"{MetadataMediaType.BOX2D.value!r}. Valid options: {sorted(o.value for o in valid_thumbnail_options)}."
+            )
+            self.config.GAMELIST_MEDIA_THUMBNAIL = MetadataMediaType.BOX2D
+
+        valid_image_options = VALID_GAMELIST_IMAGE_TYPES
+
+        if not isinstance(self.config.GAMELIST_MEDIA_IMAGE, str):
+            log.critical(
+                "Invalid config.yml: scan.gamelist.media.image must be a string"
+            )
+            sys.exit(3)
+
+        if self.config.GAMELIST_MEDIA_IMAGE not in valid_image_options:
+            log.warning(
+                f"Unknown scan.gamelist.media.image value "
+                f"{self.config.GAMELIST_MEDIA_IMAGE!r}; falling back to "
+                f"{MetadataMediaType.SCREENSHOT.value!r}. Valid options: {sorted(o.value for o in valid_image_options)}."
+            )
+            self.config.GAMELIST_MEDIA_IMAGE = MetadataMediaType.SCREENSHOT
+
+        if not isinstance(self.config.STREAMING_ENABLED, bool):
+            log.critical("Invalid config.yml: streaming.enabled must be a boolean")
+            sys.exit(3)
+
+        if not isinstance(self.config.STREAMING_CONTAINERS, list):
+            log.critical("Invalid config.yml: streaming.containers must be a list")
+            sys.exit(3)
 
     def get_config(self) -> Config:
         try:
             with open(self.config_file, "r") as config_file:
-                self._raw_config = yaml.load(config_file, Loader=SafeLoader) or {}
+                self._raw_config = self._safe_load_yaml(config_file)
         except FileNotFoundError:
             log.debug("Config file not found!")
+            # No file to parse, so clear any stale parse error from a prior load.
+            self._config_file_parse_error = None
 
         self._parse_config()
         self._validate_config()
@@ -594,6 +872,7 @@ class ConfigManager:
             "filesystem": {
                 "roms_folder": self.config.ROMS_FOLDER_NAME,
                 "firmware_folder": self.config.FIRMWARE_FOLDER_NAME,
+                "skip_hash_calculation": self.config.SKIP_HASH_CALCULATION,
             },
             "system": {
                 "platforms": self.config.PLATFORMS_BINDING,
@@ -615,13 +894,37 @@ class ConfigManager:
                 "priority": {
                     "metadata": self.config.SCAN_METADATA_PRIORITY,
                     "artwork": self.config.SCAN_ARTWORK_PRIORITY,
+                    **{
+                        key: self.config.SCAN_ARTWORK_PRIORITY_OVERRIDES[field]
+                        for key, field in ARTWORK_PRIORITY_KEYS.items()
+                        if field in self.config.SCAN_ARTWORK_PRIORITY_OVERRIDES
+                    },
                     "region": self.config.SCAN_REGION_PRIORITY,
+                    "region_mode": self.config.SCAN_REGION_MODE,
                     "language": self.config.SCAN_LANGUAGE_PRIORITY,
                 },
                 "media": self.config.SCAN_MEDIA,
-                "export_gamelist": self.config.GAMELIST_AUTO_EXPORT_ON_SCAN,
+                "gamelist": {
+                    "export": self.config.GAMELIST_AUTO_EXPORT_ON_SCAN,
+                    "media": {
+                        "thumbnail": str(self.config.GAMELIST_MEDIA_THUMBNAIL),
+                        "image": str(self.config.GAMELIST_MEDIA_IMAGE),
+                    },
+                },
+                "pegasus": {
+                    "export": self.config.PEGASUS_AUTO_EXPORT_ON_SCAN,
+                },
             },
         }
+
+        # The streaming section isn't editable at runtime, but it must survive
+        # a rewrite triggered by any other setter. Only emit it when non-default
+        # so we don't add empty keys to configs that never used streaming.
+        if self.config.STREAMING_ENABLED or self.config.STREAMING_CONTAINERS:
+            self._raw_config["streaming"] = {
+                "enabled": self.config.STREAMING_ENABLED,
+                "containers": self.config.STREAMING_CONTAINERS,
+            }
 
         try:
             # Ensure the config directory exists
@@ -696,6 +999,44 @@ class ConfigManager:
             pass
 
         self.config.__setattr__(exclusion_type, config_item)
+        self._update_config_file()
+
+    def update_scan_settings(
+        self,
+        *,
+        metadata_priority: list[str],
+        artwork_priority: list[str],
+        artwork_overrides: dict[str, list[str] | None],
+        region_priority: list[str],
+        language_priority: list[str],
+        media: list[str],
+        gamelist_export: bool,
+        gamelist_thumbnail: str,
+        gamelist_image: str,
+        pegasus_export: bool,
+    ) -> None:
+        """Replace the whole scan.* section and persist it to config.yml.
+
+        `artwork_overrides` is keyed by the user-facing config key
+        (cover/screenshot/manual); a None value clears that override.
+        """
+        self.config.SCAN_METADATA_PRIORITY = metadata_priority
+        self.config.SCAN_ARTWORK_PRIORITY = artwork_priority
+
+        overrides: dict[str, list[str]] = {}
+        for key, field in ARTWORK_PRIORITY_KEYS.items():
+            value = artwork_overrides.get(key)
+            if value is not None:
+                overrides[field] = value
+        self.config.SCAN_ARTWORK_PRIORITY_OVERRIDES = overrides
+
+        self.config.SCAN_REGION_PRIORITY = region_priority
+        self.config.SCAN_LANGUAGE_PRIORITY = language_priority
+        self.config.SCAN_MEDIA = media
+        self.config.GAMELIST_AUTO_EXPORT_ON_SCAN = gamelist_export
+        self.config.GAMELIST_MEDIA_THUMBNAIL = MetadataMediaType(gamelist_thumbnail)
+        self.config.GAMELIST_MEDIA_IMAGE = MetadataMediaType(gamelist_image)
+        self.config.PEGASUS_AUTO_EXPORT_ON_SCAN = pegasus_export
         self._update_config_file()
 
 

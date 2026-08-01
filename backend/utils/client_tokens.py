@@ -38,7 +38,7 @@ def parse_expiry(expires_in: str | None) -> datetime | None:
     delta = EXPIRY_MAP.get(expires_in)
     if delta is None:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Invalid expires_in value: {expires_in}. "
             f"Valid values: {', '.join(EXPIRY_MAP.keys())}, never",
         )
@@ -79,6 +79,7 @@ def build_create_schema(token: ClientToken, raw_token: str) -> ClientTokenCreate
         last_used_at=token.last_used_at,
         created_at=token.created_at,
         user_id=token.user_id,
+        device_id=token.device_id,
         raw_token=raw_token,
     )
 
@@ -92,6 +93,7 @@ def build_schema(token: ClientToken) -> ClientTokenSchema:
         last_used_at=token.last_used_at,
         created_at=token.created_at,
         user_id=token.user_id,
+        device_id=token.device_id,
     )
 
 
@@ -104,7 +106,10 @@ def build_admin_schema(token: ClientToken) -> ClientTokenAdminSchema:
         last_used_at=token.last_used_at,
         created_at=token.created_at,
         user_id=token.user_id,
+        device_id=token.device_id,
         username=token.user.username,
+        user_avatar_path=token.user.avatar_path,
+        user_updated_at=token.user.updated_at,
     )
 
 

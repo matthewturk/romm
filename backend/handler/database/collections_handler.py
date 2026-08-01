@@ -1,9 +1,19 @@
 import functools
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, insert, literal, or_, select, update
+from sqlalchemy import (
+    Select,
+    delete,
+    insert,
+    literal,
+    or_,
+    select,
+    union_all,
+    update,
+)
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
     Query,
     QueryableAttribute,
@@ -19,10 +29,17 @@ from models.collection import (
     CollectionRom,
     SmartCollection,
     VirtualCollection,
+    VirtualCollectionRom,
 )
 from models.rom import Rom
+from utils.database import json_array_contains_value
 
 from .base_handler import DBBaseHandler
+
+MAX_VIRTUAL_COLLECTION_COVERS = 5
+
+# Collections per UNION ALL statement, to keep any single statement small.
+COVERS_BATCH_SIZE = 100
 
 
 def with_roms(func):
@@ -130,12 +147,87 @@ class DBCollectionsHandler(DBBaseHandler):
             )
             # Insert new CollectionRom entries for this collection
             if rom_ids:
+                # Filter out rom_ids that no longer exist in the roms table to
+                # avoid foreign key constraint violations (e.g. after a rescan)
+                valid_rom_ids = set(
+                    session.scalars(select(Rom.id).where(Rom.id.in_(rom_ids))).all()
+                )
+                if valid_rom_ids:
+                    session.execute(
+                        insert(CollectionRom),
+                        [
+                            {"collection_id": id, "rom_id": rom_id}
+                            for rom_id in valid_rom_ids
+                        ],
+                    )
+
+        return session.scalar(query.filter_by(id=id).limit(1))
+
+    @begin_session
+    @with_roms
+    def add_roms_to_collection(
+        self,
+        id: int,
+        rom_ids: list[int],
+        query: Query = None,  # type: ignore
+        session: Session = None,  # type: ignore
+    ) -> Collection:
+        if rom_ids:
+            valid_rom_ids = set(
+                session.scalars(select(Rom.id).where(Rom.id.in_(rom_ids))).all()
+            )
+            existing_ids = set(
+                session.scalars(
+                    select(CollectionRom.rom_id).where(
+                        CollectionRom.collection_id == id
+                    )
+                ).all()
+            )
+            new_ids = valid_rom_ids - existing_ids
+            if new_ids:
+                try:
+                    with session.begin_nested():
+                        session.execute(
+                            insert(CollectionRom),
+                            [
+                                {"collection_id": id, "rom_id": rom_id}
+                                for rom_id in new_ids
+                            ],
+                        )
+                except IntegrityError:
+                    # Concurrent request inserted the same rows; data is consistent
+                    pass
                 session.execute(
-                    insert(CollectionRom),
-                    [
-                        {"collection_id": id, "rom_id": rom_id}
-                        for rom_id in set(rom_ids)
-                    ],
+                    update(Collection)
+                    .where(Collection.id == id)
+                    .values(updated_at=datetime.now(timezone.utc))
+                    .execution_options(synchronize_session="evaluate")
+                )
+
+        return session.scalar(query.filter_by(id=id).limit(1))
+
+    @begin_session
+    @with_roms
+    def remove_roms_from_collection(
+        self,
+        id: int,
+        rom_ids: list[int],
+        query: Query = None,  # type: ignore
+        session: Session = None,  # type: ignore
+    ) -> Collection:
+        if rom_ids:
+            result = session.execute(
+                delete(CollectionRom).where(
+                    CollectionRom.collection_id == id,
+                    CollectionRom.rom_id.in_(rom_ids),
+                )
+            )
+            if result.rowcount > 0:
+                session.execute(
+                    update(Collection)
+                    .where(Collection.id == id)
+                    .values(updated_at=datetime.now(timezone.utc))
+                    .execution_options(synchronize_session="evaluate")
                 )
 
         return session.scalar(query.filter_by(id=id).limit(1))
@@ -153,6 +245,62 @@ class DBCollectionsHandler(DBBaseHandler):
         )
 
     # Virtual collections
+    def _attach_covers(
+        self,
+        session: Session,
+        collections: Sequence[VirtualCollection],
+    ) -> None:
+        """Fill in each collection's covers from its membership rows.
+
+        The view deliberately doesn't aggregate covers: on a large library that
+        is megabytes of cover paths per request, while callers render a handful.
+
+        Each collection gets its own primary-key lookup capped at
+        MAX_VIRTUAL_COLLECTION_COVERS rows, batched into UNION ALL statements,
+        so the cost follows the number of collections rather than the size of
+        the library.
+        """
+        if not collections:
+            return
+
+        def covers_select(collection: VirtualCollection) -> Select:
+            return (
+                select(
+                    VirtualCollectionRom.type,
+                    VirtualCollectionRom.name,
+                    VirtualCollectionRom.path_cover_s,
+                    VirtualCollectionRom.path_cover_l,
+                )
+                .where(
+                    VirtualCollectionRom.type == collection.type,
+                    VirtualCollectionRom.name == collection.name,
+                    or_(
+                        VirtualCollectionRom.path_cover_s != "",
+                        VirtualCollectionRom.path_cover_l != "",
+                    ),
+                )
+                .order_by(VirtualCollectionRom.rom_id)
+                .limit(MAX_VIRTUAL_COLLECTION_COVERS)
+            )
+
+        covers: dict[tuple[str, str], tuple[list[str], list[str]]] = {}
+        for start in range(0, len(collections), COVERS_BATCH_SIZE):
+            batch = collections[start : start + COVERS_BATCH_SIZE]
+            selects = [covers_select(collection) for collection in batch]
+            statement = selects[0] if len(selects) == 1 else union_all(*selects)
+
+            for row in session.execute(statement).all():
+                small, large = covers.setdefault((row.type, row.name), ([], []))
+                if row.path_cover_s:
+                    small.append(row.path_cover_s)
+                if row.path_cover_l:
+                    large.append(row.path_cover_l)
+
+        for collection in collections:
+            small, large = covers.get((collection.type, collection.name), ([], []))
+            collection.path_covers_s = small
+            collection.path_covers_l = large
+
     @begin_session
     def get_virtual_collection(
         self,
@@ -160,9 +308,13 @@ class DBCollectionsHandler(DBBaseHandler):
         session: Session = None,  # type: ignore
     ) -> VirtualCollection | None:
         name, type = VirtualCollection.from_id(id)
-        return session.scalar(
+        collection = session.scalar(
             select(VirtualCollection).filter_by(name=name, type=type).limit(1)
         )
+        if collection:
+            self._attach_covers(session, [collection])
+
+        return collection
 
     @begin_session
     def get_virtual_collections(
@@ -180,9 +332,21 @@ class DBCollectionsHandler(DBBaseHandler):
         )
 
         if only_fields:
+            # Identifier-only callers never render covers.
             query = query.options(load_only(*only_fields))
+            return session.scalars(query).unique().all()
 
-        return session.scalars(query).unique().all()
+        collections = session.scalars(query).unique().all()
+        self._attach_covers(session, collections)
+
+        return collections
+
+    def get_virtual_collection_rom_ids(self, id: str) -> Select:
+        """Select the rom ids of a virtual collection, as an indexed subquery."""
+        name, type = VirtualCollection.from_id(id)
+        return select(VirtualCollectionRom.rom_id).where(
+            VirtualCollectionRom.type == type, VirtualCollectionRom.name == name
+        )
 
     # Smart collections
     @begin_session
@@ -240,6 +404,41 @@ class DBCollectionsHandler(DBBaseHandler):
         return session.scalars(query).unique().all()
 
     @begin_session
+    def get_smart_collections_for_rom(
+        self,
+        rom_id: int,
+        user_id: int,
+        session: Session = None,  # type: ignore
+    ) -> Sequence[SmartCollection]:
+        # Membership is a cached JSON array of rom ids on the collection, so
+        # push containment + visibility into SQL rather than loading every
+        # collection's rom_ids blob into Python and scanning it (see #3934).
+        return (
+            session.scalars(
+                select(SmartCollection)
+                .where(
+                    json_array_contains_value(
+                        SmartCollection.rom_ids, rom_id, session=session
+                    ),
+                    or_(
+                        SmartCollection.user_id == user_id,
+                        SmartCollection.is_public,
+                    ),
+                )
+                .options(
+                    load_only(
+                        SmartCollection.id,
+                        SmartCollection.name,
+                        SmartCollection.is_public,
+                    )
+                )
+                .order_by(SmartCollection.name.asc())
+            )
+            .unique()
+            .all()
+        )
+
+    @begin_session
     def update_smart_collection(
         self,
         id: int,
@@ -282,7 +481,7 @@ class DBCollectionsHandler(DBBaseHandler):
             if new_value := criteria.get(new_key):
                 return new_value if isinstance(new_value, list) else [new_value]
             if old_value := criteria.get(old_key):
-                return [old_value]
+                return old_value if isinstance(old_value, list) else [old_value]
             return None
 
         # Apply conversions
@@ -293,6 +492,7 @@ class DBCollectionsHandler(DBBaseHandler):
         age_ratings = convert_legacy_filter("age_ratings", "selected_age_rating")
         regions = convert_legacy_filter("regions", "selected_region")
         languages = convert_legacy_filter("languages", "selected_language")
+        tags = convert_legacy_filter("tags", "selected_tag")
         statuses = convert_legacy_filter("statuses", "selected_status")
 
         # Use the existing filter_roms method with the stored criteria
@@ -311,6 +511,9 @@ class DBCollectionsHandler(DBBaseHandler):
             duplicate=criteria.get("duplicate"),
             playable=criteria.get("playable"),
             has_ra=criteria.get("has_ra"),
+            has_saves=criteria.get("has_saves"),
+            has_states=criteria.get("has_states"),
+            has_soundtrack=criteria.get("has_soundtrack"),
             missing=criteria.get("missing"),
             verified=criteria.get("verified"),
             genres=genres,
@@ -321,6 +524,9 @@ class DBCollectionsHandler(DBBaseHandler):
             statuses=statuses,
             regions=regions,
             languages=languages,
+            player_counts=criteria.get("player_counts"),
+            tags=tags,
+            metadata_providers=criteria.get("metadata_providers"),
             # Logic operators for multi-value filters
             genres_logic=criteria.get("genres_logic", "any"),
             franchises_logic=criteria.get("franchises_logic", "any"),
@@ -329,7 +535,10 @@ class DBCollectionsHandler(DBBaseHandler):
             age_ratings_logic=criteria.get("age_ratings_logic", "any"),
             regions_logic=criteria.get("regions_logic", "any"),
             languages_logic=criteria.get("languages_logic", "any"),
+            player_counts_logic=criteria.get("player_counts_logic", "any"),
             statuses_logic=criteria.get("statuses_logic", "any"),
+            metadata_providers_logic=criteria.get("metadata_providers_logic", "any"),
+            tags_logic=criteria.get("tags_logic", "any"),
             user_id=user_id,
             order_by=criteria.get("order_by", "name"),
             order_dir=criteria.get("order_dir", "asc"),

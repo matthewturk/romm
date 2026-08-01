@@ -1,15 +1,16 @@
-from datetime import datetime
 from typing import Any
 
-from pydantic import model_validator
+from pydantic import ConfigDict, model_validator
 from sqlalchemy import inspect
 from sqlalchemy.exc import InvalidRequestError
 
-from .base import BaseModel
+from .base import BaseModel, UTCDatetime
 from .device import DeviceSyncSchema
 
 
 class BaseAsset(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     rom_id: int
     user_id: int
@@ -24,22 +25,32 @@ class BaseAsset(BaseModel):
 
     missing_from_fs: bool
 
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
+    created_at: UTCDatetime
+    updated_at: UTCDatetime
 
 
 class ScreenshotSchema(BaseAsset):
-    pass
+    is_gallery: bool = False
+    is_public: bool = False
+
+
+class UserScreenshotSchema(ScreenshotSchema):
+    """A gallery screenshot enriched with its owner's username, for the
+    community (My / Community) view. Mirrors UserNoteSchema."""
+
+    username: str
+    # Author identity for rendering an avatar next to community screenshots.
+    user_avatar_path: str = ""
+    user_updated_at: UTCDatetime | None = None
 
 
 class SaveSchema(BaseAsset):
     emulator: str | None
     slot: str | None = None
     content_hash: str | None = None
+    is_public: bool = False
     screenshot: ScreenshotSchema | None
+    origin_device_id: str | None = None
     device_syncs: list[DeviceSyncSchema] = []
 
     @model_validator(mode="before")
@@ -62,6 +73,16 @@ class SaveSchema(BaseAsset):
         return result
 
 
+class UserSaveSchema(SaveSchema):
+    """A save enriched with its owner's username, for the community (My /
+    Community) view. Mirrors UserScreenshotSchema."""
+
+    username: str
+    # Author identity for rendering an avatar next to community saves.
+    user_avatar_path: str = ""
+    user_updated_at: UTCDatetime | None = None
+
+
 class SlotSummarySchema(BaseModel):
     slot: str | None
     count: int
@@ -75,4 +96,15 @@ class SaveSummarySchema(BaseModel):
 
 class StateSchema(BaseAsset):
     emulator: str | None
+    is_public: bool = False
     screenshot: ScreenshotSchema | None
+
+
+class UserStateSchema(StateSchema):
+    """A state enriched with its owner's username, for the community (My /
+    Community) view. Mirrors UserScreenshotSchema."""
+
+    username: str
+    # Author identity for rendering an avatar next to community states.
+    user_avatar_path: str = ""
+    user_updated_at: UTCDatetime | None = None

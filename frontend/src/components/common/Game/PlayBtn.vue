@@ -28,6 +28,11 @@ const { config } = storeToRefs(configStore);
 const { value: heartbeat } = storeToRefs(heartbeatStore);
 const emitter = inject<Emitter<Events>>("emitter");
 
+const isAprilFools = computed(() => {
+  const today = new Date();
+  return today.getMonth() === 3 && today.getDate() === 1;
+});
+
 const isEmulationSupported = computed(() => {
   return (
     isEJSEmulationSupported(
@@ -87,16 +92,29 @@ async function goToPlayer(rom: SimpleRom) {
       name: ROUTES.PARCHMENT,
       params: { rom: rom.id },
     });
+  } else if (isAprilFools.value) {
+    await router.push({ name: ROUTES.APRIL_FOOLS });
   }
 }
 </script>
 
 <template>
-  <template v-if="isEmulationSupported">
-    <v-btn v-if="iconEmbedded" v-bind="attrs" :disabled="rom.missing_from_fs" :aria-label="`Play ${rom.name}`"
-      icon="mdi-play" @click="goToPlayer(rom)" />
-    <v-btn v-else v-bind="attrs" :disabled="rom.missing_from_fs" :aria-label="`Play ${rom.name}`"
-      @click="goToPlayer(rom)">
+  <template v-if="isEmulationSupported || isAprilFools">
+    <v-btn
+      v-if="iconEmbedded"
+      v-bind="attrs"
+      :disabled="rom.missing_from_fs"
+      :aria-label="`Play ${rom.name}`"
+      icon="mdi-play"
+      @click="goToPlayer(rom)"
+    />
+    <v-btn
+      v-else
+      v-bind="attrs"
+      :disabled="rom.missing_from_fs"
+      :aria-label="`Play ${rom.name}`"
+      @click="goToPlayer(rom)"
+    >
       <v-icon>mdi-play</v-icon>
     </v-btn>
   </template>

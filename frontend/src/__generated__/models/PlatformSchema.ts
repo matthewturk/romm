@@ -12,7 +12,9 @@ export type PlatformSchema = {
     igdb_slug: (string | null);
     moby_slug: (string | null);
     hltb_slug: (string | null);
+    libretro_slug: (string | null);
     custom_name?: (string | null);
+    description?: (string | null);
     igdb_id?: (number | null);
     sgdb_id?: (number | null);
     moby_id?: (number | null);
@@ -29,7 +31,6 @@ export type PlatformSchema = {
     url?: (string | null);
     url_logo?: (string | null);
     firmware?: Array<FirmwareSchema>;
-    aspect_ratio?: string;
     created_at: string;
     updated_at: string;
     fs_size_bytes: number;

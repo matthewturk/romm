@@ -2,8 +2,6 @@ from datetime import timedelta
 
 import pytest
 from fastapi import status
-from fastapi.testclient import TestClient
-from main import app
 
 from config import OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS
 from handler.auth import auth_handler, oauth_handler
@@ -11,24 +9,6 @@ from handler.database import db_client_token_handler, db_user_handler
 from handler.redis_handler import sync_cache
 from models.client_token import ClientToken
 from models.user import Role
-
-
-@pytest.fixture
-def client():
-    with TestClient(app) as client:
-        yield client
-
-
-@pytest.fixture
-def editor_access_token(editor_user):
-    return oauth_handler.create_access_token(
-        data={
-            "sub": editor_user.username,
-            "iss": "romm:oauth",
-            "scopes": " ".join(editor_user.oauth_scopes),
-        },
-        expires_delta=timedelta(seconds=OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS),
-    )
 
 
 @pytest.fixture
@@ -41,12 +21,6 @@ def viewer_access_token(viewer_user):
         },
         expires_delta=timedelta(seconds=OAUTH_ACCESS_TOKEN_EXPIRE_SECONDS),
     )
-
-
-@pytest.fixture(autouse=True)
-def clear_cache():
-    yield
-    sync_cache.flushall()
 
 
 class TestClientTokenCRUD:
@@ -68,6 +42,8 @@ class TestClientTokenCRUD:
         assert set(body["scopes"]) == {"roms.read", "assets.read"}
         assert body["expires_at"] is not None
         assert body["user_id"] == admin_user.id
+        # Manually-created tokens are unbound until a device-flow binds them
+        assert body["device_id"] is None
 
     def test_create_token_minimal(self, client, access_token, admin_user):
         response = client.post(
@@ -102,6 +78,7 @@ class TestClientTokenCRUD:
         assert names == {"Token A", "Token B"}
         for t in tokens:
             assert "raw_token" not in t
+            assert t["device_id"] is None
 
     def test_delete_token(self, client, access_token, admin_user):
         create_resp = client.post(
@@ -190,7 +167,7 @@ class TestClientTokenCRUD:
             },
             headers={"Authorization": f"Bearer {access_token}"},
         )
-        assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+        assert response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
 
 
 class TestClientTokenAuth:
@@ -284,8 +261,8 @@ class TestClientTokenAuth:
         )
         raw_token = create_resp.json()["raw_token"]
 
-        # Demote user to viewer
-        db_user_handler.update_user(admin_user.id, {"role": Role.VIEWER})
+        # Demote admin to a regular user
+        db_user_handler.update_user(admin_user.id, {"role": Role.USER})
 
         # users.write should no longer be effective
         response = client.get(

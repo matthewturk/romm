@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libmagic-dev \
     7zip \
+    libarchive-tools \
     tzdata \
     libbz2-dev \
     libssl-dev \
@@ -37,10 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV NVM_DIR="/root/.nvm"
 RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash \
     && . "$NVM_DIR/nvm.sh" \
-    && nvm install 24.13.1 \
-    && nvm use 24.13.1 \
-    && nvm alias default 24.13.1
-ENV PATH="$NVM_DIR/versions/node/v24.13.1/bin:$PATH"
+    && nvm install 24.16.0 \
+    && nvm use 24.16.0 \
+    && nvm alias default 24.16.0
+ENV PATH="$NVM_DIR/versions/node/v24.16.0/bin:$PATH"
 
 # Build and install RAHasher (optional for RA hashes)
 RUN git clone --recursive --branch 1.8.3 --depth 1 https://github.com/RetroAchievements/RALibretro.git /tmp/RALibretro
@@ -54,11 +55,16 @@ COPY frontend/package.json /app/frontend/
 WORKDIR /app/frontend
 RUN npm install
 
+# Install backend Node helpers (server-side ROM patching)
+COPY backend/utils/rom_patcher/package.json /app/backend/utils/rom_patcher/
+WORKDIR /app/backend/utils/rom_patcher
+RUN npm install
+
 # Set working directory
 WORKDIR /app
 
 # Install uv for the non-root user
-COPY --from=ghcr.io/astral-sh/uv:0.7.19 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
 
 # Install Python
 RUN uv python install 3.13

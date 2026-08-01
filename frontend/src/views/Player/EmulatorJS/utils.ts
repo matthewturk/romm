@@ -1,3 +1,4 @@
+import Bowser from "bowser";
 import { type SaveSchema } from "@/__generated__";
 import { type StateSchema } from "@/__generated__";
 import saveApi from "@/services/api/save";
@@ -23,6 +24,14 @@ export async function saveState({
   stateFile: ArrayBuffer;
   screenshotFile?: ArrayBuffer;
 }): Promise<StateSchema | null> {
+  // A zero-length buffer means the core failed to serialize its state (a torn
+  // read from a running threaded core). Refuse to upload it so a broken
+  // capture can't overwrite the user's good states on the server.
+  if (stateFile.byteLength === 0) {
+    console.error("Refusing to upload empty state file");
+    return null;
+  }
+
   const filename = buildStateName(rom);
   try {
     const uploadedStates = await stateApi.uploadStates({
@@ -59,11 +68,13 @@ export async function saveSave({
   save,
   saveFile,
   screenshotFile,
+  deviceId,
 }: {
   rom: DetailedRom;
   save: SaveSchema | null;
   saveFile: ArrayBuffer;
   screenshotFile?: ArrayBuffer;
+  deviceId?: string;
 }): Promise<SaveSchema | null> {
   if (save) {
     try {
@@ -78,6 +89,7 @@ export async function saveSave({
                 type: "application/octet-stream",
               })
             : undefined,
+        deviceId,
       });
 
       // Update the save in the rom object
@@ -96,6 +108,7 @@ export async function saveSave({
     const uploadedSaves = await saveApi.uploadSaves({
       rom: rom,
       emulator: window.EJS_core,
+      deviceId,
       savesToUpload: [
         {
           saveFile: new File([saveFile], `${filename}.srm`, {
@@ -139,6 +152,211 @@ export function loadEmulatorJSSave(save: Uint8Array) {
 
 export function loadEmulatorJSState(state: Uint8Array) {
   window.EJS_emulator.gameManager.loadState(state);
+}
+
+export function invalidateEmulatorJSRomCacheIfRenamed(rom: {
+  id: number;
+  fs_name: string;
+}) {
+  const fsNameStorageKey = `player:${rom.id}:fs_name`;
+  const previousFsName = localStorage.getItem(fsNameStorageKey);
+
+  if (previousFsName && previousFsName !== rom.fs_name) {
+    window.indexedDB.deleteDatabase("EmulatorJS-roms");
+  }
+
+  localStorage.setItem(fsNameStorageKey, rom.fs_name);
+}
+
+// EmulatorJS drops the config.yaml defaults (EJS_defaultOptions) in two spots:
+// - preGetSetting short-circuits to the saved-settings localStorage object
+//   once ANY setting or control was changed, returning undefined for keys the
+//   user never touched (webgl2Enabled, vsync, shader, ...).
+// - getCoreSettings builds the RetroArch core options file, but returns ""
+//   when localStorage is enabled and holds no saved entry yet, so on a fresh
+//   launch core options (e.g. mupen64plus-FXAA) never reach the core.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function installDefaultOptionsFallback(emulator: any) {
+  if (emulator.__rommSettingsPatched) return;
+  emulator.__rommSettingsPatched = true;
+
+  const originalPreGetSetting = emulator.preGetSetting.bind(emulator);
+  emulator.preGetSetting = (setting: string) => {
+    const value = originalPreGetSetting(setting);
+    if (value !== undefined && value !== null) return value;
+    const defaults = emulator.config?.defaultOptions ?? {};
+    return defaults[setting] !== undefined ? defaults[setting] : null;
+  };
+
+  emulator.getCoreSettings = () => {
+    const defaults: Record<string, unknown> =
+      emulator.config?.defaultOptions ?? {};
+    let saved: Record<string, unknown> = {};
+    if (window.localStorage && !emulator.config?.disableLocalStorage) {
+      try {
+        const raw = localStorage.getItem(emulator.getLocalStorageKey());
+        const parsed = raw ? JSON.parse(raw) : null;
+        if (parsed?.settings instanceof Object) saved = parsed.settings;
+      } catch (error) {
+        console.warn("Could not load previous settings", error);
+      }
+    }
+    const merged = { ...defaults, ...saved };
+    let output = "";
+    for (const key in merged) {
+      const value = merged[key];
+      // Match upstream formatting: numeric values unquoted, strings quoted.
+      const formatted = Number.isNaN(Number(value)) ? `"${value}"` : value;
+      output += `${key} = ${formatted}\n`;
+    }
+    return output;
+  };
+
+  // Recompute the values the constructor captured via the unpatched
+  // preGetSetting. They are consumed after this point: rewindEnabled when
+  // GameManager writes retroarch.cfg, webgl2Enabled when the core variant is
+  // picked during download, videoRotation on the first resize.
+  emulator.rewindEnabled =
+    emulator.preGetSetting("rewindEnabled") === "enabled";
+  if (![0, 1, 2, 3].includes(emulator.config?.videoRotation)) {
+    emulator.videoRotation = emulator.preGetSetting("videoRotation") || 0;
+  }
+  const webgl2Setting = emulator.preGetSetting("webgl2Enabled");
+  if (webgl2Setting === "disabled" || !emulator.supportsWebgl2) {
+    emulator.webgl2Enabled = false;
+  } else if (webgl2Setting === "enabled") {
+    emulator.webgl2Enabled = true;
+  } else {
+    emulator.webgl2Enabled = null;
+  }
+}
+
+// Trap the window.EJS_emulator assignment so the instance is patched right
+// after the constructor returns, before the async core download and boot
+// consume any of the patched values. Patching later (e.g. in EJS_onGameStart)
+// is too late: by then the GL context exists, retroarch.cfg and the core
+// options file are written, and saved settings were already applied.
+export function installEJSDefaultOptionsTrap() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let instance: any;
+  Object.defineProperty(window, "EJS_emulator", {
+    configurable: true,
+    get: () => instance,
+    set: (value) => {
+      instance = value;
+      if (value) installDefaultOptionsFallback(value);
+    },
+  });
+}
+
+const IOS_FULLSCREEN_NAV_SELECTOR =
+  ".v-app-bar, .v-bottom-navigation, .v-navigation-drawer";
+const IOS_FULLSCREEN_STYLE = `
+  [data-ios-fullscreen-active] {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100vw !important;
+    height: 100svh !important;
+    z-index: 99999 !important;
+    background: #000 !important;
+  }
+  [data-ios-fullscreen-hidden] { display: none !important; }
+`;
+
+function isIOSFullscreenShimRequired() {
+  const osName = Bowser.getParser(navigator.userAgent).getOSName(true);
+  return (
+    osName === "ios" ||
+    // iPadOS 13+ reports as macOS with touch support, so fall back to that check.
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+export function installIOSFullscreenShim() {
+  if (!isIOSFullscreenShimRequired()) {
+    return () => {};
+  }
+
+  const proto = HTMLElement.prototype;
+  const overrides: Array<{
+    target: object;
+    key: PropertyKey;
+    prev?: PropertyDescriptor;
+  }> = [];
+  const override = (
+    target: object,
+    key: PropertyKey,
+    descriptor: PropertyDescriptor,
+  ) => {
+    overrides.push({
+      target,
+      key,
+      prev: Object.getOwnPropertyDescriptor(target, key),
+    });
+    Object.defineProperty(target, key, { configurable: true, ...descriptor });
+  };
+
+  const styleEl = document.createElement("style");
+  styleEl.textContent = IOS_FULLSCREEN_STYLE;
+  document.head.appendChild(styleEl);
+
+  let fullscreenElement: HTMLElement | null = null;
+
+  const dispatchChange = (target: HTMLElement) => {
+    document.dispatchEvent(new Event("fullscreenchange"));
+    target.dispatchEvent(new Event("fullscreenchange"));
+  };
+
+  const enter = (el: HTMLElement) => {
+    if (fullscreenElement === el) return Promise.resolve();
+    if (fullscreenElement) void exit();
+
+    el.setAttribute("data-ios-fullscreen-active", "");
+    document
+      .querySelectorAll<HTMLElement>(IOS_FULLSCREEN_NAV_SELECTOR)
+      .forEach((nav) => nav.setAttribute("data-ios-fullscreen-hidden", ""));
+    fullscreenElement = el;
+    dispatchChange(el);
+    return Promise.resolve();
+  };
+
+  const exit = () => {
+    const el = fullscreenElement;
+    if (!el) return Promise.resolve();
+    el.removeAttribute("data-ios-fullscreen-active");
+    document
+      .querySelectorAll<HTMLElement>("[data-ios-fullscreen-hidden]")
+      .forEach((nav) => nav.removeAttribute("data-ios-fullscreen-hidden"));
+    fullscreenElement = null;
+    dispatchChange(el);
+    return Promise.resolve();
+  };
+
+  override(document, "fullscreenEnabled", { get: () => true });
+  override(document, "fullscreenElement", { get: () => fullscreenElement });
+  override(document, "exitFullscreen", { value: exit, writable: true });
+  override(proto, "requestFullscreen", {
+    value: function (this: HTMLElement) {
+      return enter(this);
+    },
+    writable: true,
+  });
+  override(proto, "webkitRequestFullscreen", {
+    value: function (this: HTMLElement) {
+      void enter(this);
+    },
+    writable: true,
+  });
+
+  return () => {
+    void exit();
+    styleEl.remove();
+    while (overrides.length) {
+      const { target, key, prev } = overrides.pop()!;
+      if (prev) Object.defineProperty(target, key, prev);
+      else Reflect.deleteProperty(target, key);
+    }
+  };
 }
 
 export function createQuickLoadButton(): HTMLButtonElement {

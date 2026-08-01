@@ -1,22 +1,26 @@
 import os
 import re
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Body, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 
+from config import MAX_AUTOCLEANUP_LIMIT
 from decorators.auth import protected_route
 from endpoints.responses.assets import SaveSchema, SaveSummarySchema, SlotSummarySchema
 from endpoints.responses.device import DeviceSyncSchema
 from exceptions.endpoint_exceptions import RomNotFoundInDatabaseException
 from handler.auth.constants import Scope
+from handler.auth.dependencies import assert_rom_visible
 from handler.database import (
     db_device_handler,
     db_device_save_sync_handler,
     db_rom_handler,
     db_save_handler,
     db_screenshot_handler,
+    db_sync_session_handler,
 )
 from handler.filesystem import fs_asset_handler
 from handler.scan_handler import scan_save, scan_screenshot
@@ -29,36 +33,69 @@ from models.device_save_sync import DeviceSaveSync
 from utils.datetime import to_utc
 from utils.filesystem import sanitize_filename
 from utils.router import APIRouter
+from utils.uploads import check_asset_upload_size
 
 
 def _build_save_schema(
     save: Save,
+    syncs: Sequence[tuple[DeviceSaveSync, str | None]] = (),
     device: Device | None = None,
-    sync: DeviceSaveSync | None = None,
 ) -> SaveSchema:
+    """Attach one ``DeviceSyncSchema`` per device that has synced this save.
+
+    ``syncs`` is the full list of sync rows (paired with device name) for this
+    save across every device, so clients can attribute the save to its creator.
+    ``device`` is the caller's device, when supplied: its entry is emitted first
+    for stable ordering and old-client compatibility, and a placeholder entry is
+    synthesized when the caller has not yet synced this save.
+    """
     save_schema = SaveSchema.model_validate(save)
 
-    if device:
-        if sync:
-            is_current = to_utc(sync.last_synced_at) >= to_utc(save.updated_at)
-            last_synced = sync.last_synced_at
-            is_untracked = sync.is_untracked
-        else:
-            is_current = False
-            last_synced = save.updated_at
-            is_untracked = False
+    save_updated = to_utc(save.updated_at)
+    caller_present = False
+    entries: list[DeviceSyncSchema] = []
+    for sync, device_name in syncs:
+        if device and sync.device_id == device.id:
+            caller_present = True
+        entries.append(
+            DeviceSyncSchema(
+                device_id=sync.device_id,
+                device_name=device_name,
+                last_synced_at=sync.last_synced_at,
+                is_untracked=sync.is_untracked,
+                is_current=to_utc(sync.last_synced_at) >= save_updated,
+            )
+        )
 
-        save_schema.device_syncs = [
+    if device and not caller_present:
+        entries.append(
             DeviceSyncSchema(
                 device_id=device.id,
                 device_name=device.name,
-                last_synced_at=last_synced,
-                is_untracked=is_untracked,
-                is_current=is_current,
+                last_synced_at=save.updated_at,
+                is_untracked=False,
+                is_current=False,
             )
-        ]
+        )
 
+    if device:
+        entries.sort(key=lambda entry: entry.device_id != device.id)
+
+    save_schema.device_syncs = entries
     return save_schema
+
+
+def _syncs_for_save(
+    save_id: int, device: Device | None
+) -> list[tuple[DeviceSaveSync, str | None]]:
+    """Fetch every device sync for a single save when a device is in context.
+
+    Device attribution is only meaningful to a device-scoped caller, so callers
+    without a device get an empty list and no query is issued.
+    """
+    if not device:
+        return []
+    return db_device_save_sync_handler.get_syncs_for_saves([save_id]).get(save_id, [])
 
 
 DATETIME_TAG_PATTERN = re.compile(r" \[\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\]")
@@ -95,6 +132,16 @@ def _resolve_device(
     return device
 
 
+def _increment_session_counter(session_id: int, user_id: int) -> None:
+    try:
+        db_sync_session_handler.increment_operations_completed(
+            session_id=session_id,
+            user_id=user_id,
+        )
+    except Exception:
+        log.warning(f"Failed to update sync session {session_id}", exc_info=True)
+
+
 router = APIRouter(
     prefix="/saves",
     tags=["saves"],
@@ -116,6 +163,7 @@ async def add_save(
     emulator: str | None = None,
     slot: str | None = None,
     device_id: str | None = None,
+    session_id: int | None = None,
     overwrite: bool = False,
     autocleanup: bool = False,
     autocleanup_limit: int = 10,
@@ -123,6 +171,12 @@ async def add_save(
     screenshotFile: UploadFile | None = SAVE_SCREENSHOT_UPLOAD,
 ) -> SaveSchema:
     """Upload a save file for a ROM."""
+    check_asset_upload_size(saveFile, "Save file")
+    check_asset_upload_size(screenshotFile, "Screenshot file")
+
+    # Keep at least the save just uploaded, and cap what a client can retain
+    autocleanup_limit = max(1, min(autocleanup_limit, MAX_AUTOCLEANUP_LIMIT))
+
     device = _resolve_device(
         device_id, request.user.id, request.auth.scopes, Scope.DEVICES_WRITE
     )
@@ -149,8 +203,15 @@ async def add_save(
     if slot:
         actual_filename = _apply_datetime_tag(sanitized_save_filename)
 
+    saves_path = fs_asset_handler.build_saves_file_path(
+        user=request.user,
+        platform_fs_slug=rom.platform.fs_slug,
+        rom_id=rom.id,
+        emulator=emulator,
+    )
+
     db_save = db_save_handler.get_save_by_filename(
-        user_id=request.user.id, rom_id=rom.id, file_name=actual_filename
+        user_id=request.user.id, rom_id=rom.id, file_name=actual_filename, slot=slot
     )
 
     if device and slot and not overwrite:
@@ -186,13 +247,6 @@ async def add_save(
         f"Uploading save {hl(actual_filename)} for {hl(str(rom.name), color=BLUE)}"
     )
 
-    saves_path = fs_asset_handler.build_saves_file_path(
-        user=request.user,
-        platform_fs_slug=rom.platform.fs_slug,
-        rom_id=rom.id,
-        emulator=emulator,
-    )
-
     await fs_asset_handler.write_file(
         file=saveFile, path=saves_path, filename=actual_filename
     )
@@ -210,32 +264,60 @@ async def add_save(
             user_id=request.user.id,
             rom_id=rom.id,
             content_hash=scanned_save.content_hash,
+            slot=slot,
         )
         if existing_by_hash:
             try:
                 await fs_asset_handler.remove_file(f"{saves_path}/{actual_filename}")
             except FileNotFoundError:
                 pass
-            sync = None
-            if device:
-                sync = db_device_save_sync_handler.get_sync(
-                    device_id=device.id, save_id=existing_by_hash.id
-                )
-            return _build_save_schema(existing_by_hash, device, sync)
+            return _build_save_schema(
+                existing_by_hash, _syncs_for_save(existing_by_hash.id, device), device
+            )
+
+    if db_save is None:
+        # Refresh hash if the file already exists to avoid mismatched metadata.
+        colliding_save = db_save_handler.get_save_by_path(
+            user_id=request.user.id,
+            rom_id=rom.id,
+            file_path=scanned_save.file_path,
+            file_name=actual_filename,
+        )
+        if colliding_save and colliding_save.content_hash != scanned_save.content_hash:
+            db_save = colliding_save
 
     if db_save:
+        # Track file path and emulator to prevent hash-content drift.
+        stale_full_path = db_save.full_path
         update_data: dict = {
             "file_size_bytes": scanned_save.file_size_bytes,
             "content_hash": scanned_save.content_hash,
+            "file_path": scanned_save.file_path,
+            "emulator": emulator,
         }
         if slot is not None:
             update_data["slot"] = slot
         db_save = db_save_handler.update_save(db_save.id, update_data)
+
+        # Delete orphaned bytes only if no other row references the old path.
+        if stale_full_path != db_save.full_path:
+            still_referenced = any(
+                other.id != db_save.id and other.full_path == stale_full_path
+                for other in db_save_handler.get_saves(
+                    user_id=request.user.id, rom_id=rom.id
+                )
+            )
+            if not still_referenced:
+                try:
+                    await fs_asset_handler.remove_file(stale_full_path)
+                except FileNotFoundError:
+                    pass
     else:
         scanned_save.rom_id = rom.id
         scanned_save.user_id = request.user.id
         scanned_save.emulator = emulator
         scanned_save.slot = slot
+        scanned_save.origin_device_id = device.id if device else None
         db_save = db_save_handler.add_save(save=scanned_save)
 
     if device:
@@ -243,6 +325,9 @@ async def add_save(
             device_id=device.id, save_id=db_save.id, synced_at=db_save.updated_at
         )
         db_device_handler.update_last_seen(device_id=device.id, user_id=request.user.id)
+
+    if session_id:
+        _increment_session_counter(session_id, request.user.id)
 
     if slot and autocleanup:
         slot_saves = db_save_handler.get_saves(
@@ -306,12 +391,7 @@ async def add_save(
         rom_user.id, {"last_played": datetime.now(timezone.utc)}
     )
 
-    sync = None
-    if device:
-        sync = db_device_save_sync_handler.get_sync(
-            device_id=device.id, save_id=db_save.id
-        )
-    return _build_save_schema(db_save, device, sync)
+    return _build_save_schema(db_save, _syncs_for_save(db_save.id, device), device)
 
 
 @protected_route(router.get, "", [Scope.ASSETS_READ])
@@ -334,13 +414,13 @@ def get_saves(
     if not device:
         return [_build_save_schema(save) for save in saves]
 
-    syncs = db_device_save_sync_handler.get_syncs_for_device_and_saves(
-        device_id=device.id, save_ids=[s.id for s in saves]
+    syncs_by_save_id = db_device_save_sync_handler.get_syncs_for_saves(
+        [s.id for s in saves]
     )
-    sync_by_save_id = {s.save_id: s for s in syncs}
 
     return [
-        _build_save_schema(save, device, sync_by_save_id.get(save.id)) for save in saves
+        _build_save_schema(save, syncs_by_save_id.get(save.id, []), device)
+        for save in saves
     ]
 
 
@@ -388,12 +468,7 @@ def get_save(request: Request, id: int, device_id: str | None = None) -> SaveSch
             detail=f"Save with ID {id} not found",
         )
 
-    sync = None
-    if device:
-        sync = db_device_save_sync_handler.get_sync(
-            device_id=device.id, save_id=save.id
-        )
-    return _build_save_schema(save, device, sync)
+    return _build_save_schema(save, _syncs_for_save(save.id, device), device)
 
 
 @protected_route(router.get, "/{id}/content", [Scope.ASSETS_READ])
@@ -401,6 +476,7 @@ def download_save(
     request: Request,
     id: int,
     device_id: str | None = None,
+    session_id: int | None = None,
     optimistic: bool = True,
 ) -> FileResponse:
     """Download a save file."""
@@ -408,12 +484,21 @@ def download_save(
         device_id, request.user.id, request.auth.scopes, Scope.DEVICES_READ
     )
 
-    save = db_save_handler.get_save(user_id=request.user.id, id=id)
-    if not save:
+    # Owner can download any of their saves; everyone else only public ones.
+    save = db_save_handler.get_save_by_id(id)
+    if not save or (save.user_id != request.user.id and not save.is_public):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Save with ID {id} not found",
         )
+
+    # Sharing must not override the hidden-ROM/platform policy: a save on a ROM
+    # hidden from the caller stays 404-masked, just like the ROM itself.
+    assert_rom_visible(
+        request, save.rom, not_found_detail=f"Save with ID {id} not found"
+    )
+
+    is_owner = save.user_id == request.user.id
 
     try:
         file_path = fs_asset_handler.validate_path(save.full_path)
@@ -429,13 +514,17 @@ def download_save(
             detail="Save file not found on disk",
         )
 
-    if device and optimistic:
+    # Sync bookkeeping only makes sense for the owner's own saves.
+    if device and optimistic and is_owner:
         db_device_save_sync_handler.upsert_sync(
             device_id=device.id,
             save_id=save.id,
             synced_at=save.updated_at,
         )
         db_device_handler.update_last_seen(device_id=device.id, user_id=request.user.id)
+
+    if session_id:
+        _increment_session_counter(session_id, request.user.id)
 
     return FileResponse(path=str(file_path), filename=save.file_name)
 
@@ -455,24 +544,32 @@ def confirm_download(
         )
 
     device = _resolve_device(device_id, request.user.id)
-    sync = db_device_save_sync_handler.upsert_sync(
+    db_device_save_sync_handler.upsert_sync(
         device_id=device_id,
         save_id=save.id,
         synced_at=save.updated_at,
     )
     db_device_handler.update_last_seen(device_id=device_id, user_id=request.user.id)
 
-    return _build_save_schema(save, device, sync)
+    return _build_save_schema(save, _syncs_for_save(save.id, device), device)
 
 
 @protected_route(router.put, "/{id}", [Scope.ASSETS_WRITE])
 async def update_save(
     request: Request,
     id: int,
+    device_id: str | None = None,
     saveFile: UploadFile | None = SAVE_FILE_UPDATE,
     screenshotFile: UploadFile | None = SAVE_SCREENSHOT_UPDATE,
 ) -> SaveSchema:
     """Update a save file."""
+
+    check_asset_upload_size(saveFile, "Save file")
+    check_asset_upload_size(screenshotFile, "Screenshot file")
+
+    device = _resolve_device(
+        device_id, request.user.id, request.auth.scopes, Scope.DEVICES_WRITE
+    )
 
     db_save = db_save_handler.get_save(user_id=request.user.id, id=id)
     if not db_save:
@@ -484,8 +581,19 @@ async def update_save(
         await fs_asset_handler.write_file(
             file=saveFile, path=db_save.file_path, filename=db_save.file_name
         )
+        scanned_save = await scan_save(
+            file_name=db_save.file_name,
+            user=request.user,
+            platform_fs_slug=db_save.rom.platform_fs_slug,
+            rom_id=db_save.rom_id,
+            emulator=db_save.emulator,
+        )
         db_save = db_save_handler.update_save(
-            db_save.id, {"file_size_bytes": saveFile.size}
+            db_save.id,
+            {
+                "file_size_bytes": scanned_save.file_size_bytes,
+                "content_hash": scanned_save.content_hash,
+            },
         )
 
     if screenshotFile and screenshotFile.filename:
@@ -539,8 +647,44 @@ async def update_save(
         rom_user.id, {"last_played": datetime.now(timezone.utc)}
     )
 
-    # Refetch the save to get updated fields
-    return SaveSchema.model_validate(db_save)
+    if device:
+        db_device_save_sync_handler.upsert_sync(
+            device_id=device.id, save_id=db_save.id, synced_at=db_save.updated_at
+        )
+        db_device_handler.update_last_seen(device_id=device.id, user_id=request.user.id)
+
+    return _build_save_schema(db_save, _syncs_for_save(db_save.id, device), device)
+
+
+@protected_route(
+    router.put,
+    "/{id}/visibility",
+    [Scope.ASSETS_WRITE],
+    responses={status.HTTP_404_NOT_FOUND: {}},
+)
+def update_save_visibility(
+    request: Request,
+    id: int,
+    is_public: Annotated[bool, Body(embed=True)],
+) -> SaveSchema:
+    """Toggle a save's public/private visibility (owner only)."""
+    save = db_save_handler.get_save_by_id(id)
+    if not save or save.user_id != request.user.id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Save with ID {id} not found",
+        )
+
+    updated = db_save_handler.update_save(id, {"is_public": is_public})
+
+    # Keep the auto-captured thumbnail's visibility in sync so a shared save
+    # still renders its preview for other users.
+    if save.screenshot:
+        db_screenshot_handler.update_screenshot(
+            save.screenshot.id, {"is_public": is_public}
+        )
+
+    return _build_save_schema(updated)
 
 
 @protected_route(
@@ -615,11 +759,11 @@ def track_save(
         )
 
     device = _resolve_device(device_id, request.user.id)
-    sync = db_device_save_sync_handler.set_untracked(
+    db_device_save_sync_handler.set_untracked(
         device_id=device_id, save_id=id, untracked=False
     )
 
-    return _build_save_schema(save, device, sync)
+    return _build_save_schema(save, _syncs_for_save(save.id, device), device)
 
 
 @protected_route(router.post, "/{id}/untrack", [Scope.DEVICES_WRITE])
@@ -637,8 +781,8 @@ def untrack_save(
         )
 
     device = _resolve_device(device_id, request.user.id)
-    sync = db_device_save_sync_handler.set_untracked(
+    db_device_save_sync_handler.set_untracked(
         device_id=device_id, save_id=id, untracked=True
     )
 
-    return _build_save_schema(save, device, sync)
+    return _build_save_schema(save, _syncs_for_save(save.id, device), device)

@@ -14,6 +14,7 @@ from .platforms import get_platform
 from .remote_source import RemoteSource
 from .types import (
     DASH_COLON_REGEX,
+    LAUNCHBOX_METADATA_INITIAL_IMPORT_KEY,
     LAUNCHBOX_METADATA_NAME_KEY,
     LAUNCHBOX_PLATFORMS_DIR,
     LAUNCHBOX_TAG_REGEX,
@@ -39,8 +40,31 @@ class LaunchboxHandler(MetadataHandler):
     def is_enabled(cls) -> bool:
         return cls.is_cloud_enabled() or cls.is_local_enabled()
 
+    @staticmethod
+    async def is_remote_store_populated() -> bool:
+        return bool(await async_cache.exists(LAUNCHBOX_METADATA_NAME_KEY))
+
+    @staticmethod
+    async def is_remote_store_importing() -> bool:
+        return bool(await async_cache.exists(LAUNCHBOX_METADATA_INITIAL_IMPORT_KEY))
+
     async def heartbeat(self) -> bool:
-        return self.is_enabled()
+        if self.is_local_enabled():
+            return True
+
+        if not self.is_cloud_enabled():
+            return False
+
+        # A first import commits in batches, so the store starts answering for a
+        # handful of names long before it holds the whole dump. Until that run
+        # finishes, most lookups still miss.
+        if await self.is_remote_store_importing():
+            return False
+
+        # Cloud lookups read from a cache the metadata update task fills. Until
+        # it has run, every lookup returns nothing, so reporting healthy here
+        # would be a lie.
+        return await self.is_remote_store_populated()
 
     def get_platform(self, slug: str) -> LaunchboxPlatform:
         return get_platform(slug)
@@ -60,9 +84,7 @@ class LaunchboxHandler(MetadataHandler):
 
         local = await self._local.get_rom(fs_name, platform_slug)
 
-        remote_available = remote_enabled and bool(
-            await async_cache.exists(LAUNCHBOX_METADATA_NAME_KEY)
-        )
+        remote_available = remote_enabled and await self.is_remote_store_populated()
 
         if local is not None:
             launchbox_id_local = safe_int(local.get("DatabaseID"))
@@ -128,6 +150,16 @@ class LaunchboxHandler(MetadataHandler):
         else:
             search_term = fs_name
 
+        # Resolve MAME arcade filename (e.g. wrlok_l3.zip) to its full title
+        # via LaunchBox's Mame.xml before name-based lookup.
+        if platform_slug == UPS.ARCADE:
+            mame_entry = await self._remote.get_mame_entry(fs_name)
+            if mame_entry:
+                name = (mame_entry.get("Name") or "").strip()
+                if name:
+                    search_term = name
+                    fallback_rom = LaunchboxRom(launchbox_id=None, name=name)
+
         # We replace " - "/"- " with ": " to match Launchbox's naming convention
         search_term = re.sub(DASH_COLON_REGEX, ": ", search_term).lower()
 
@@ -152,6 +184,8 @@ class LaunchboxHandler(MetadataHandler):
             remote=index_entry,
             remote_images=remote_images,
             remote_enabled=remote_available,
+            platform_name=get_platform(platform_slug).get("name"),
+            fs_name=fs_name,
         )
 
         return build_rom(
@@ -162,7 +196,12 @@ class LaunchboxHandler(MetadataHandler):
         )
 
     async def get_rom_by_id(
-        self, database_id: int, *, remote_enabled: bool = True
+        self,
+        database_id: int,
+        *,
+        remote_enabled: bool = True,
+        fs_name: str | None = None,
+        platform_slug: str | None = None,
     ) -> LaunchboxRom:
         if not self.is_enabled():
             return LaunchboxRom(launchbox_id=None)
@@ -174,17 +213,42 @@ class LaunchboxHandler(MetadataHandler):
         if not remote:
             return LaunchboxRom(launchbox_id=None)
 
+        # Merge local-only fields when a local LaunchBox install has the same game
+        local: dict[str, str] | None = None
+        if fs_name and platform_slug:
+            candidate = await self._local.get_rom(fs_name, platform_slug)
+            if (
+                candidate is not None
+                and safe_int(candidate.get("DatabaseID")) == database_id
+            ):
+                local = candidate
+
+        platform_name = (
+            get_platform(platform_slug).get("name") if platform_slug else None
+        )
         remote_images = await self._remote.fetch_images(
             remote=remote, remote_enabled=remote_enabled
         )
-        media_req = remote_media_req(
-            remote=remote,
-            remote_images=remote_images,
-            remote_enabled=remote_enabled,
-        )
+        if local is not None:
+            media_req = local_media_req(
+                platform_name=platform_name,
+                fs_name=fs_name or "",
+                local=local,
+                remote=remote,
+                remote_images=remote_images,
+                remote_enabled=remote_enabled,
+            )
+        else:
+            media_req = remote_media_req(
+                remote=remote,
+                remote_images=remote_images,
+                remote_enabled=remote_enabled,
+                platform_name=platform_name,
+                fs_name=fs_name or "",
+            )
 
         return build_rom(
-            local=None,
+            local=local,
             remote=remote,
             launchbox_id=database_id,
             media_req=media_req,
@@ -195,6 +259,13 @@ class LaunchboxHandler(MetadataHandler):
     ) -> list[LaunchboxRom]:
         if not self.is_enabled():
             return []
+
+        if self.is_cloud_enabled() and not await self.is_remote_store_populated():
+            log.warning(
+                "LaunchBox metadata store is empty, so no cloud results can be "
+                "returned. Set ENABLE_SCHEDULED_UPDATE_LAUNCHBOX_METADATA=true and "
+                "run the LaunchBox metadata update task to populate it."
+            )
 
         rom = await self.get_rom(search_term, platform_slug, keep_tags=True)
         return [rom]

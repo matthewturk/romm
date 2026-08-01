@@ -82,44 +82,57 @@
 #   priority:
 #     # Below are the default priority values used
 #     metadata: # Top-level metadata source priority
-#       - "igdb" # IGDB (highest priority)
-#       - "moby" # MobyGames
-#       - "ss" # Screenscraper
-#       - "ra" # RetroAchievements
-#       - "launchbox" # Launchbox
-#       - "gamelist" # ES-DE gamelist.xml
-#       - "hasheous" # Hasheous
-#       - "flashpoint" # Flashpoint Project
-#       - "hltb" # HowLongToBeat (lowest priority)
+#       - igdb # IGDB (highest priority)
+#       - moby # MobyGames
+#       - ss # Screenscraper
+#       - ra # RetroAchievements
+#       - launchbox # Launchbox
+#       - gamelist # ES-DE gamelist.xml
+#       - hasheous # Hasheous
+#       - flashpoint # Flashpoint Project
+#       - hltb # HowLongToBeat (lowest priority)
 #     artwork: # Cover art and screenshots
-#       - "igdb" # IGDB
-#       - "moby" # MobyGames
-#       - "ss" # Screenscraper
-#       - "ra" # RetroAchievements
-#       - "launchbox" # Launchbox
-#       - "gamelist" # ES-DE gamelist.xml
-#       - "hasheous" # Hasheous
-#       - "flashpoint" # Flashpoint Project
-#       - "hltb" # HowLongToBeat
+#       - igdb # IGDB
+#       - moby # MobyGames
+#       - ss # Screenscraper
+#       - ra # RetroAchievements
+#       - launchbox # Launchbox
+#       - libretro # Libretro
+#       - gamelist # ES-DE gamelist.xml
+#       - hasheous # Hasheous
+#       - flashpoint # Flashpoint Project
+#       - hltb # HowLongToBeat
+#     # Optional per-field overrides, each falls back to "artwork" when omitted
+#     cover: # Cover art only
+#       - igdb
+#       - ss
+#     screenshot: # Screenshots only
+#       - ss
+#       - igdb
+#     manual: # Game manuals only
+#       - launchbox
 #     region: # Used by IGDB and ScreenScraper for regional variants
-#       - "us"
-#       - "wor"
-#       - "ss"
-#       - "eu"
-#       - "jp"
+#       - us
+#       - wor
+#       - ss
+#       - eu
+#       - jp
+#     region_mode: prefer_rom_tags # Region tags win over priority list
 #     language: # Used by ScreenScraper for descriptions
-#       - "en"
-#       - "fr"
-#     # Media assets to download
-#     # Only used by Screenscraper and ES-DE gamelist.xml
+#       - en
+#       - fr
+#   # Media assets to download
+#   # Only used by Screenscraper and ES-DE gamelist.xml
 #   media:
 #     # Used as alternative cover art
 #     - box2d  # Normal cover art (always enabled)
 #     - box3d  # 3D box art
-#     - miximage  # Mixed image of multiple media
+#     - miximage  # Mixed image of multiple media (v1 / mixrbv1)
+#     - miximage_v2  # Mixed image of multiple media (v2 / mixrbv2)
 #     - physical  # Disc, cartridge, etc.
 #     # Added to the screenshots carousel
 #     - screenshot  # Screenshot (enabled by default)
+#     # Shown in the artwork gallery
 #     - title_screen  # Title screen
 #     - fanart  # User uploaded artwork
 #     # Bezel displayed around the emulatorjs window
@@ -131,9 +144,19 @@
 #     - video_normalized  # Normalized video (smaller file size than video)
 #     # Media used for batocera gamelist.xml export
 #     - box2d_back  # Back cover art
+#     - box2d_side  # Box spine (enables the interactive 3D box on detail pages)
 #     - logo  # Transparent logo
 #     # Other media assets (might be used in the future)
 #     - marquee  # Custom marquee
+#   # Auto-export metadata files after scan completes
+#   gamelist:
+#     export: false # Whether to export gamelist.xml for ES-DE/Batocera/RetroBAT
+#     media:
+#       # Select a media type from the list above (eg. box2d, screenshot, etc.)
+#       thumbnail: box2d # Use as the <thumbnail> tag in the exported gamelist.xml
+#       image: screenshot  # Use as the <image> tag in the exported gamelist.xml
+#   pegasus:
+#     export: false # Whether to export metadata.pegasus.txt for Pegasus
 
 # EmulatorJS per-core options
 # emulatorjs:
@@ -164,3 +187,25 @@
 #       1: # Player 2
 #       2: # Player 3
 #       3: # Player 4
+
+# streaming:
+#   enabled: true
+#   containers:
+#     - platform: ps2
+#       # Browser-facing Selkies web UI, MUST be served over https
+#       # (use a reverse proxy or the built in self signed cert for linuxserver)
+#       # can also be a FQDN eg. https://your.example.com
+#       host: https://192.168.1.51:3001
+#
+#       # server-to-broker URL does NOT need to be served over https
+#       # If pcsx2 emulator is on a different host, use its LAN IP.
+#       # If on the same Docker network, use the container name: http://pcsx2:8000
+#       broker_host: http://192.168.1.51:8000
+#       # what shows up on the play button
+#       label: PCSX2
+#
+#     # Add more emulator containers here as needed:
+#     # - platform: psx
+#     #   host: http://192.168.1.51:3002
+#     #   broker_host: http://192.168.1.51:8001
+#     #   label: DuckStation

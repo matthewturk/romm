@@ -9,12 +9,15 @@ import { buildFormInput } from "@/utils/formData";
 
 export const saveApi = api;
 
-type SaveUploadInput = AddSaveInput & {
+type SaveUploadInput = Omit<AddSaveInput, "saveFile" | "screenshotFile"> & {
   saveFile: File;
   screenshotFile?: File;
 };
 
-type UpdateSaveUploadInput = UpdateSaveInput & {
+type UpdateSaveUploadInput = Omit<
+  UpdateSaveInput,
+  "saveFile" | "screenshotFile"
+> & {
   saveFile: File;
   screenshotFile?: File;
 };
@@ -23,10 +26,12 @@ async function uploadSaves({
   rom,
   savesToUpload,
   emulator,
+  deviceId,
 }: {
   rom: DetailedRomSchema;
   savesToUpload: SaveUploadInput[];
   emulator?: string;
+  deviceId?: string;
 }) {
   const promises = savesToUpload.map(({ saveFile, screenshotFile }) => {
     const formData = buildFormInput<SaveUploadInput>([
@@ -40,7 +45,7 @@ async function uploadSaves({
           headers: {
             "Content-Type": "multipart/form-data",
           },
-          params: { rom_id: rom.id, emulator },
+          params: { rom_id: rom.id, emulator, device_id: deviceId },
         })
         .then(({ data }) => {
           resolve(data);
@@ -56,25 +61,42 @@ async function updateSave({
   save,
   saveFile,
   screenshotFile,
+  deviceId,
 }: {
   save: SaveSchema;
   saveFile: UpdateSaveUploadInput["saveFile"];
   screenshotFile?: UpdateSaveUploadInput["screenshotFile"];
+  deviceId?: string;
 }) {
   const formData = buildFormInput<UpdateSaveUploadInput>([
     ["saveFile", saveFile],
     ["screenshotFile", screenshotFile],
   ]);
 
-  return api.put<SaveSchema>(`/saves/${save.id}`, formData);
+  return api.put<SaveSchema>(`/saves/${save.id}`, formData, {
+    params: { device_id: deviceId },
+  });
 }
 
 async function deleteSaves({ saves }: { saves: SaveSchema[] }) {
   return api.post<number[]>("/saves/delete", { saves: saves.map((s) => s.id) });
 }
 
+async function setSaveVisibility({
+  id,
+  isPublic,
+}: {
+  id: number;
+  isPublic: boolean;
+}) {
+  return api.put<SaveSchema>(`/saves/${id}/visibility`, {
+    is_public: isPublic,
+  });
+}
+
 export default {
   uploadSaves,
   updateSave,
   deleteSaves,
+  setSaveVisibility,
 };
