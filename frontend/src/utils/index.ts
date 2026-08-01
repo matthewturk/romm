@@ -700,7 +700,7 @@ export function isParchmentEmulationSupported(
   // if (heartbeat.EMULATION.DISABLE_PARCHMENT) return false;
 
   const slug = config?.PLATFORMS_VERSIONS[platformSlug] || platformSlug;
-  return ["z-machine"].includes(slug.toLowerCase());
+  return ["z-machine", "glulx"].includes(slug.toLowerCase());
 }
 
 export type PlayingStatus =

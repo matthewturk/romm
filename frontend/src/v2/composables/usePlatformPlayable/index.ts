@@ -11,9 +11,9 @@
 // `emulator` resolves to the in-browser engine that actually drives the
 // platform: "ruffle" for Flash, "dosbox" when the EJS catalogue picks
 // the dosbox_pure core (DOS is wrapped by EJS but distinctive enough to
-// surface by name in the UI), "parchment" for Z-machine interactive
-// fiction, "emulatorjs" for everything else playable, and `null` when
-// nothing on the server can run it.
+// surface by name in the UI), "parchment" for Z-machine and Glulx
+// interactive fiction, "emulatorjs" for everything else playable, and
+// `null` when nothing on the server can run it.
 import { storeToRefs } from "pinia";
 import { computed, type ComputedRef } from "vue";
 import storeConfig, { type Config } from "@/stores/config";
