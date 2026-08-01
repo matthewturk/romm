@@ -74,18 +74,22 @@ export function useGameActions(
   // delete that 403s.
   const canDelete = computed(() => hasDeleteGrant.value && canEdit.value);
   const { isFavorite, toggleFavorite } = useFavoriteToggle(emitter);
-  const { canPlayEJS, canPlayRuffle } = useCanPlay(getRom);
+  const { canPlayEJS, canPlayRuffle, canPlayParchment } = useCanPlay(getRom);
   const streamingStore = useStreamingStore();
 
   // Streaming is the preferred way to play where a container is
   // configured for the platform — the native emulator runs in a
   // separate container and RomM streams it back. Wins over in-browser
-  // EJS/Ruffle when both are available.
+  // EJS/Ruffle/Parchment when both are available.
   const canPlayStream = computed(() =>
     Boolean(streamingStore.containerForPlatform(getRom()?.platform_slug)),
   );
   const canPlay = computed(
-    () => canPlayStream.value || canPlayEJS.value || canPlayRuffle.value,
+    () =>
+      canPlayStream.value ||
+      canPlayEJS.value ||
+      canPlayRuffle.value ||
+      canPlayParchment.value,
   );
 
   const isFavorited = computed(() => {
@@ -257,6 +261,7 @@ export function useGameActions(
     let path: string | null = null;
     if (canPlayStream.value) path = `/rom/${rom.id}/stream`;
     else if (canPlayRuffle.value) path = `/rom/${rom.id}/ruffle`;
+    else if (canPlayParchment.value) path = `/rom/${rom.id}/parchment`;
     if (!path) return;
     const target = path;
     // When the caller supplies a cover element (the gallery card / detail

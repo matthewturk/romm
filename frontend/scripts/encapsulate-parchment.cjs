@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const { scopeCss } = require("./lib/scoper.cjs");
 
 const inputFile = path.resolve(
   __dirname,
@@ -10,142 +11,39 @@ const outputFile = path.resolve(
   "../src/assets/parchment-scoped.css",
 );
 
+const ROOT_SELECTOR = "#parchment-root";
+
 // Ensure output dir exists
 const outputDir = path.dirname(outputFile);
 if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
 }
 
-function scopeCss(css, rootSelector) {
-  let output = "";
-  let buffer = "";
-  let index = 0;
-  const len = css.length;
-
-  while (index < len) {
-    const char = css[index];
-
-    // Handle comments roughly
-    if (char === "/" && css[index + 1] === "*") {
-      const closeIndex = css.indexOf("*/", index + 2);
-      if (closeIndex !== -1) {
-        // Keep comments in buffer so they appear before selector?
-        // Or append to output if buffer empty?
-        // Let's just treat them as part of buffer.
-        buffer += css.substring(index, closeIndex + 2);
-        index = closeIndex + 2;
-        continue;
-      }
-    }
-
-    if (char === "{") {
-      const selectorBlock = buffer.trim();
-      buffer = ""; // reset buffer
-
-      // Capture the block content
-      let braceDepth = 1;
-      let searchIndex = index + 1;
-      while (searchIndex < len && braceDepth > 0) {
-        if (css[searchIndex] === "{") braceDepth++;
-        else if (css[searchIndex] === "}") braceDepth--;
-        searchIndex++;
-      }
-
-      const endOfBlock = searchIndex; // points after '}'
-      const closingBraceIndex = endOfBlock - 1;
-
-      // Content strictly between { and }
-      const innerContent = css.substring(index + 1, closingBraceIndex);
-
-      const cleanSelector = selectorBlock
-        .replace(/\/\*[\s\S]*?\*\//g, "")
-        .trim();
-
-      if (
-        cleanSelector.startsWith("@media") ||
-        cleanSelector.startsWith("@supports") ||
-        cleanSelector.startsWith("@document")
-      ) {
-        output += selectorBlock + " {";
-        output += scopeCss(innerContent, rootSelector);
-        output += "}";
-        // Add extra newline for readability
-        output += "\n";
-      } else if (cleanSelector.startsWith("@")) {
-        // @font-face, @keyframes, @import, @charset
-        // Keep as is?
-        // Some @ rules like @page take a block.
-        // We copy content as is without scoping inside.
-        output += selectorBlock + " {" + innerContent + "}\n";
-      } else {
-        // Standard CSS Rule
-        // Prefix the selector(s)
-        const prefixed = selectorBlock
-          .split(",")
-          .map((sel) => {
-            const trimmed = sel.trim();
-            if (!trimmed) return "";
-            if (trimmed.startsWith("/*")) return trimmed; // comment only line?
-
-            let replaced = trimmed;
-            // Replace specific global tag selectors or :root
-            replaced = replaced.replace(/:root/g, rootSelector);
-            replaced = replaced.replace(/\bbody\b/g, rootSelector);
-            replaced = replaced.replace(/\bhtml\b/g, rootSelector);
-
-            if (replaced.includes(rootSelector)) {
-              return replaced;
-            }
-
-            // AsyncGlk/Parchment dialogs are appended to document.body, so they are outside #parchment-root.
-            // We need to ensure styles apply to them as well by adding a body-scoped selector.
-            if (replaced.includes("dialog")) {
-              return `${rootSelector} ${replaced}, body > ${replaced}`;
-            }
-
-            // Space is important
-            return `${rootSelector} ${replaced}`;
-          })
-          .join(", ");
-
-        output += prefixed + " {" + innerContent + "}\n";
-      }
-
-      index = endOfBlock;
-    } else {
-      buffer += char;
-      index++;
-    }
-  }
-
-  return output + buffer;
-}
-
-const css = fs.readFileSync(inputFile, "utf-8");
-
-try {
-  const scoped = scopeCss(css, "#parchment-root");
-
-  // Append custom overrides
-  const overrides = `
+// Custom overrides for the RomM Parchment integration.
+const overrides = `
 /* Custom overrides for RomM Parchment integration */
 
 /* Apply max width setting to the buffer text area */
-#parchment-root .BufferWindowInner {
+${ROOT_SELECTOR} .BufferWindowInner {
   max-width: var(--glkote-content-max-width, none);
   margin: 0 auto;
 }
 
-/* Ensure dialogs are centered */
-#parchment-root dialog, body > dialog {
+/* Keep the file dialog centered whether it lives in the body or has been
+   moved into #parchment-root for fullscreen. */
+${ROOT_SELECTOR} dialog,
+body dialog {
   margin: auto;
   inset: 0;
   max-height: fit-content;
   max-width: fit-content;
-  position: fixed; /* Force fixed positioning similar to modal behavior */
+  position: fixed;
 }
 `;
 
+try {
+  const css = fs.readFileSync(inputFile, "utf-8");
+  const scoped = scopeCss(css, ROOT_SELECTOR);
   fs.writeFileSync(outputFile, scoped + overrides);
   console.log(`Successfully encapsulated CSS to ${outputFile}`);
 } catch (e) {

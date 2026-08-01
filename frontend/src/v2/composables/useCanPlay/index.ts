@@ -4,21 +4,26 @@
 // inside PlayBtn.vue; v2 lifts it to a composable so the card overlay
 // and the menu item agree with the details-header CTA.
 //
-// "Playable" means either EJS or Ruffle can run the platform on this
-// server (admin toggles + platform support + WebGL availability). The
-// individual flags are exposed so the play action can pick the right
-// route (EJS vs Ruffle).
+// "Playable" means EJS, Ruffle, or Parchment can run the platform on this
+// server (admin toggles + platform support + WebGL availability — Parchment
+// has none of those gates). The individual flags are exposed so the play
+// action can pick the right route (EJS vs Ruffle vs Parchment).
 import { storeToRefs } from "pinia";
 import { computed, type ComputedRef } from "vue";
 import storeConfig from "@/stores/config";
 import storeHeartbeat from "@/stores/heartbeat";
 import type { SimpleRom } from "@/stores/roms";
-import { isEJSEmulationSupported, isRuffleEmulationSupported } from "@/utils";
+import {
+  isEJSEmulationSupported,
+  isParchmentEmulationSupported,
+  isRuffleEmulationSupported,
+} from "@/utils";
 
 export function useCanPlay(getRom: () => SimpleRom | null | undefined): {
   canPlay: ComputedRef<boolean>;
   canPlayEJS: ComputedRef<boolean>;
   canPlayRuffle: ComputedRef<boolean>;
+  canPlayParchment: ComputedRef<boolean>;
 } {
   const heartbeatStore = storeHeartbeat();
   const configStore = storeConfig();
@@ -44,7 +49,19 @@ export function useCanPlay(getRom: () => SimpleRom | null | undefined): {
     );
   });
 
-  const canPlay = computed(() => canPlayEJS.value || canPlayRuffle.value);
+  const canPlayParchment = computed(() => {
+    const rom = getRom();
+    if (!rom) return false;
+    return isParchmentEmulationSupported(
+      rom.platform_slug,
+      heartbeat.value,
+      configStore.config,
+    );
+  });
 
-  return { canPlay, canPlayEJS, canPlayRuffle };
+  const canPlay = computed(
+    () => canPlayEJS.value || canPlayRuffle.value || canPlayParchment.value,
+  );
+
+  return { canPlay, canPlayEJS, canPlayRuffle, canPlayParchment };
 }

@@ -18,6 +18,7 @@ const confirmFn = vi.fn();
 const confirmProtectedLaunch = { value: true };
 const canPlayEJS = { value: true };
 const canPlayRuffle = { value: false };
+const canPlayParchment = { value: false };
 const streamContainer = { value: null as object | null };
 let originalLocation: Location;
 // Granted action keys — `null` means "everything" (the default).
@@ -65,7 +66,7 @@ vi.mock("@/v2/composables/useCan", () => ({
   }),
 }));
 vi.mock("@/v2/composables/useCanPlay", () => ({
-  useCanPlay: () => ({ canPlayEJS, canPlayRuffle }),
+  useCanPlay: () => ({ canPlayEJS, canPlayRuffle, canPlayParchment }),
 }));
 vi.mock("@/v2/composables/useClipboard", () => ({
   useClipboard: () => ({ copy: vi.fn() }),
@@ -114,6 +115,7 @@ beforeEach(() => {
   confirmProtectedLaunch.value = true;
   canPlayEJS.value = true;
   canPlayRuffle.value = false;
+  canPlayParchment.value = false;
   streamContainer.value = null;
   grantedActions.value = null;
 });
@@ -175,6 +177,18 @@ describe("useGameActions.play — launch confirmation", () => {
     await actions.play();
 
     expect(push).toHaveBeenCalledWith("/rom/1/ruffle");
+    expect(locationAssign).not.toHaveBeenCalled();
+  });
+
+  it("keeps SPA navigation for Parchment", async () => {
+    canPlayEJS.value = false;
+    canPlayRuffle.value = false;
+    canPlayParchment.value = true;
+    const actions = useGameActions(() => makeRom());
+
+    await actions.play();
+
+    expect(push).toHaveBeenCalledWith("/rom/1/parchment");
     expect(locationAssign).not.toHaveBeenCalled();
   });
 });

@@ -19,6 +19,7 @@ function makeRouter() {
       { path: "/platform/:platform", name: ROUTES.PLATFORM, component: blank },
       { path: "/rom/:rom", name: ROUTES.ROM, component: blank },
       { path: "/play/:rom", name: ROUTES.EMULATORJS, component: blank },
+      { path: "/story/:rom", name: ROUTES.PARCHMENT, component: blank },
     ],
   });
 }
@@ -69,6 +70,19 @@ describe("useGalleryProvenance", () => {
     await router.push("/rom/11");
     await router.push("/play/11");
     await router.push("/rom/11");
+
+    expect(mod.useGalleryProvenance().enteredFromGallery.value).toBe(true);
+  });
+
+  it("keeps the arming across a Parchment play session", async () => {
+    const mod = await loadFresh();
+    const router = makeRouter();
+    mod.installGalleryProvenance(router);
+
+    await router.push("/platform/1");
+    await router.push("/rom/10");
+    await router.push("/story/10");
+    await router.push("/rom/10");
 
     expect(mod.useGalleryProvenance().enteredFromGallery.value).toBe(true);
   });

@@ -11,8 +11,9 @@
 // `emulator` resolves to the in-browser engine that actually drives the
 // platform: "ruffle" for Flash, "dosbox" when the EJS catalogue picks
 // the dosbox_pure core (DOS is wrapped by EJS but distinctive enough to
-// surface by name in the UI), "emulatorjs" for everything else playable,
-// and `null` when nothing on the server can run it.
+// surface by name in the UI), "parchment" for Z-machine interactive
+// fiction, "emulatorjs" for everything else playable, and `null` when
+// nothing on the server can run it.
 import { storeToRefs } from "pinia";
 import { computed, type ComputedRef } from "vue";
 import storeConfig, { type Config } from "@/stores/config";
@@ -20,10 +21,12 @@ import storeHeartbeat, { type Heartbeat } from "@/stores/heartbeat";
 import {
   getSupportedEJSCores,
   isEJSEmulationSupported,
+  isParchmentEmulationSupported,
   isRuffleEmulationSupported,
 } from "@/utils";
 
-export type PlatformEmulator = "emulatorjs" | "ruffle" | "dosbox" | null;
+export type PlatformEmulator =
+  "emulatorjs" | "ruffle" | "dosbox" | "parchment" | null;
 
 /** Pure helper — picks the engine that would actually run a platform.
  * Shared between the reactive and the batch composables so both surface
@@ -35,6 +38,8 @@ function resolveEmulator(
 ): PlatformEmulator {
   if (!slug) return null;
   if (isRuffleEmulationSupported(slug, heartbeat, config)) return "ruffle";
+  if (isParchmentEmulationSupported(slug, heartbeat, config))
+    return "parchment";
   if (!isEJSEmulationSupported(slug, heartbeat, config)) return null;
   const resolved = config?.PLATFORMS_VERSIONS[slug] || slug;
   const cores = getSupportedEJSCores(resolved);
@@ -46,6 +51,7 @@ export function usePlatformPlayable(getSlug: () => string | null | undefined): {
   playable: ComputedRef<boolean>;
   playableEJS: ComputedRef<boolean>;
   playableRuffle: ComputedRef<boolean>;
+  playableParchment: ComputedRef<boolean>;
   emulator: ComputedRef<PlatformEmulator>;
 } {
   const heartbeatStore = storeHeartbeat();
@@ -68,13 +74,25 @@ export function usePlatformPlayable(getSlug: () => string | null | undefined): {
     );
   });
 
-  const playable = computed(() => playableEJS.value || playableRuffle.value);
+  const playableParchment = computed(() => {
+    const slug = getSlug();
+    if (!slug) return false;
+    return isParchmentEmulationSupported(
+      slug,
+      heartbeat.value,
+      configStore.config,
+    );
+  });
+
+  const playable = computed(
+    () => playableEJS.value || playableRuffle.value || playableParchment.value,
+  );
 
   const emulator = computed<PlatformEmulator>(() =>
     resolveEmulator(getSlug(), heartbeat.value, configStore.config),
   );
 
-  return { playable, playableEJS, playableRuffle, emulator };
+  return { playable, playableEJS, playableRuffle, playableParchment, emulator };
 }
 
 export function usePlatformPlayableChecker(): {
@@ -97,7 +115,8 @@ export function usePlatformPlayableChecker(): {
       if (!slug) return false;
       return (
         isEJSEmulationSupported(slug, hb, cfg) ||
-        isRuffleEmulationSupported(slug, hb, cfg)
+        isRuffleEmulationSupported(slug, hb, cfg) ||
+        isParchmentEmulationSupported(slug, hb, cfg)
       );
     };
   });
@@ -120,6 +139,8 @@ export function playableTooltip(emulator: PlatformEmulator): string {
       return "Playable in browser through Ruffle";
     case "dosbox":
       return "Playable in browser through DOSBox";
+    case "parchment":
+      return "Playable in browser through Parchment";
     case "emulatorjs":
       return "Playable in browser through EmulatorJS";
     case null:

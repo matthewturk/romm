@@ -1,16 +1,25 @@
 const fs = require("fs");
+const http = require("http");
 const https = require("https");
 const path = require("path");
 const { execSync } = require("child_process");
 
 const ASSETS_DIR = path.resolve(__dirname, "../public/assets/parchment");
-const TAG = "2025.1.14";
-const DATE_STR = "2025-01-14"; // Filename uses dashes
+const VERSION = "2026.8.1";
+const DATE_STR = "2026-08-01"; // Filename uses dashes
 const FILENAME = `parchment-for-inform7-${DATE_STR}.zip`;
-const DOWNLOAD_URL = `https://github.com/curiousdannii/parchment/releases/download/${TAG}/${FILENAME}`;
+const DOWNLOAD_URL = `https://github.com/curiousdannii/parchment/releases/download/${VERSION}/${FILENAME}`;
+const VERSION_FILE = path.join(ASSETS_DIR, "version.txt");
 
-if (fs.existsSync(path.join(ASSETS_DIR, "parchment.js"))) {
-  console.log("Parchment already exists. Skipping download.");
+// Skip the download when the expected files are already present and the
+// installed version matches. This keeps `dev`/`build` fast on repeat runs
+// while still re-downloading automatically when the pinned version changes.
+if (
+  fs.existsSync(path.join(ASSETS_DIR, "parchment.js")) &&
+  fs.existsSync(VERSION_FILE) &&
+  fs.readFileSync(VERSION_FILE, "utf-8").trim() === VERSION
+) {
+  console.log(`Parchment ${VERSION} already installed. Skipping download.`);
   process.exit(0);
 }
 
@@ -22,73 +31,79 @@ if (!fs.existsSync(tempDir)) {
 
 const zipPath = path.join(tempDir, FILENAME);
 
-console.log(`Downloading Parchment ${TAG}...`);
-const file = fs.createWriteStream(zipPath);
-
-https
-  .get(DOWNLOAD_URL, (response) => {
-    if (response.statusCode === 302 || response.statusCode === 301) {
-      // Follow redirect
-      https
-        .get(response.headers.location, (res) => {
-          res.pipe(file);
-          file.on("finish", () => {
-            file.close(extract);
-          });
-        })
-        .on("error", (err) => {
-          console.error("Download error:", err);
-          process.exit(1);
-        });
-      return;
-    }
-
-    response.pipe(file);
-    file.on("finish", () => {
-      file.close(extract);
-    });
-  })
-  .on("error", (err) => {
-    fs.unlink(zipPath, () => {});
-    console.error("Download error:", err);
-    process.exit(1);
+function download(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith("https:") ? https : http;
+    const req = mod.get(
+      url,
+      { headers: { "User-Agent": "romm-parchment" } },
+      (response) => {
+        const { statusCode } = response;
+        if (
+          statusCode >= 300 &&
+          statusCode < 400 &&
+          response.headers.location &&
+          redirectsLeft > 0
+        ) {
+          response.resume();
+          resolve(download(response.headers.location, redirectsLeft - 1));
+          return;
+        }
+        if (statusCode !== 200) {
+          response.resume();
+          reject(
+            new Error(`Download failed with status ${statusCode} for ${url}`),
+          );
+          return;
+        }
+        const file = fs.createWriteStream(zipPath);
+        response.pipe(file);
+        file.on("finish", () => file.close(() => resolve()));
+        file.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.setTimeout(30000, () => req.destroy(new Error("Download timed out")));
   });
+}
 
-function extract() {
+async function extract() {
   console.log("Extracting...");
   try {
     // Use unzip command - assumes linux environment
     execSync(`unzip -o "${zipPath}" -d "${tempDir}"`);
 
-    // The zip likely contains a folder or just files.
-    // Based on typical behavior, let's list the temp dir
-    const extracted = fs.readdirSync(tempDir).filter((f) => f !== FILENAME);
+    fs.mkdirSync(ASSETS_DIR, { recursive: true });
 
-    // If it's a single folder, move its contents. If files, move them.
-    // parchment-for-inform7 zips usually contain the files directly or in a folder.
-    // Let's assume files are in `tempDir` or `tempDir/parchment-for-inform7-date`.
-
-    // We move everything to ASSETS_DIR
-    if (!fs.existsSync(ASSETS_DIR)) {
-      fs.mkdirSync(ASSETS_DIR, { recursive: true });
-    }
-
-    // Check if there's a subfolder
-    const subfolder = extracted.find(
-      (f) =>
-        fs.lstatSync(path.join(tempDir, f)).isDirectory() &&
-        f.includes("parchment"),
+    // The release zip contains a single top-level folder (e.g. `Parchment/`).
+    // Move its contents up so the assets live directly in ASSETS_DIR, keeping
+    // the paths referenced by the player (`/assets/parchment/parchment.js`).
+    const entries = fs.readdirSync(tempDir).filter((f) => f !== FILENAME);
+    const subdir = entries.find((f) =>
+      fs.lstatSync(path.join(tempDir, f)).isDirectory(),
     );
-    const sourceDir = subfolder ? path.join(tempDir, subfolder) : tempDir;
+    const sourceDir = subdir ? path.join(tempDir, subdir) : tempDir;
 
-    // Copy files
     execSync(`cp -r "${sourceDir}/"* "${ASSETS_DIR}/"`);
-    console.log(`Parchment installed to ${ASSETS_DIR}`);
-
-    // Clean up
-    execSync(`rm -rf "${tempDir}"`);
+    fs.writeFileSync(VERSION_FILE, VERSION);
+    console.log(`Parchment ${VERSION} installed to ${ASSETS_DIR}`);
   } catch (e) {
     console.error("Extraction failed:", e);
     process.exit(1);
+  } finally {
+    // Clean up
+    execSync(`rm -rf "${tempDir}"`);
   }
 }
+
+(async () => {
+  console.log(`Downloading Parchment ${VERSION}...`);
+  try {
+    await download(DOWNLOAD_URL);
+    await extract();
+  } catch (err) {
+    fs.unlink(zipPath, () => {});
+    console.error("Download error:", err);
+    process.exit(1);
+  }
+})();
